@@ -38,7 +38,11 @@ We have an extensive set of e2e tests that test the integration with *real* clou
 Maintainers must trigger these kind of tests manually for PRs that come from forked repositories. These tests run inside a `kind` cluster in the GitHub Actions runner:
 
 ```
-/ok-to-test sha=xxxxxx
+/ok-to-test sha=<full_commit_hash>
+```
+Examples:
+```
+/ok-to-test sha=b8ca0040200a7a05d57048d86a972fdf833b8c9b
 ```
 
 #### Executing e2e tests locally
@@ -72,9 +76,11 @@ a maintainer when a particular provider or authentication mechanism was changed:
 /ok-to-test-managed sha=xxxxxx provider=aws
 # or
 /ok-to-test-managed sha=xxxxxx provider=gcp
+# or
+/ok-to-test-managed sha=xxxxxx provider=azure
 ```
 
-Both tests can run in parallel. Once started they add a dynamic GitHub check `integration-managed-(gcp|aws)` to the PR that triggered the test.
+Both tests can run in parallel. Once started they add a dynamic GitHub check `integration-managed-(gcp|aws|azure)` to the PR that triggered the test.
 
 
 ### Executing Managed Kubernetes e2e tests locally

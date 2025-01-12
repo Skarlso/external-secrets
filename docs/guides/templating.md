@@ -1,7 +1,15 @@
 # Advanced Templating v2
 
-With External Secrets Operator you can transform the data from the external secret provider before it is stored as `Kind=Secret`. You can do this with the `Spec.Target.Template`. Each data value is interpreted as a [golang template](https://golang.org/pkg/text/template/).
+With External Secrets Operator you can transform the data from the external secret provider before it is stored as `Kind=Secret`. You can do this with the `Spec.Target.Template`.
 
+Each data value is interpreted as a [Go template](https://golang.org/pkg/text/template/). Please note that referencing a non-existing key in the template will raise an error, instead of being suppressed.
+
+!!! note
+
+    Consider using camelcase when defining  **.'spec.data.secretkey'**, example: serviceAccountToken
+
+    If your secret keys contain **`-` (dashes)**, you will need to reference them using **`index`** </br>
+    Example: **`\{\{ index .data "service-account-token" \}\}`**
 
 ## Helm
 
@@ -26,12 +34,13 @@ Another example with two keys in the same secret:
 ```
 
 ### MergePolicy
+
 By default, the templating mechanism will not use any information available from the original `data` and `dataFrom` queries to the provider, and only keep the templated information. It is possible to change this behavior through the use of the `mergePolicy` field. `mergePolicy` currently accepts two values: `Replace` (the default) and `Merge`. When using `Merge`, `data` and `dataFrom` keys will also be embedded into the templated secret, having lower priority than the template outcome. See the example for more information:
 
 ```yaml
 {% include 'merge-template-v2-external-secret.yaml' %}
-
 ```
+
 ### TemplateFrom
 
 You do not have to define your templates inline in an ExternalSecret but you can pull `ConfigMaps` or other Secrets that contain a template. Consider the following example:
@@ -47,6 +56,22 @@ You do not have to define your templates inline in an ExternalSecret but you can
 ```
 
 Lastly, `TemplateFrom` also supports adding `Literal` blocks for quick templating. These `Literal` blocks differ from `Template.Data` as they are rendered as a a `key:value` pair (while the `Template.Data`, you can only template the value).
+
+See an example, how to produce a `htpasswd` file that can be used by an ingress-controller (for example: https://kubernetes.github.io/ingress-nginx/examples/auth/basic/) where the contents of the `htpasswd` file needs to be presented via the `auth` key. We use the `htpasswd` function to create a `bcrytped` hash of the password.
+
+Suppose you have multiple key-value pairs within your provider secret like
+
+```json
+{
+  "user1": "password1",
+  "user2": "password2",
+  ...
+}
+```
+
+```yaml
+{% include 'template-v2-literal-example.yaml' %}
+```
 
 ### Extract Keys and Certificates from PKCS#12 Archive
 
@@ -99,7 +124,27 @@ NtFUGA95RGN9s+pl6XY0YARPHf5O76ErC1OZtDTR5RdyQfcM+94gYZsexsXl0aQO
 
 ```
 
-You can achieve that by using the `filterPEM` function to extract a specific type of PEM block from that secret. If multiple blocks of that type (here: `CERTIFICATE`) exist then all of them are returned in the order they are specified.
+You can achieve that by using the `filterPEM` function to extract a specific type of PEM block from that secret. If multiple blocks of that type (here: `CERTIFICATE`) exist, all of them are returned in the order specified. To extract a specific type of PEM block, pass the type as a string argument to the filterPEM function. Take a look at this example of how to transform a secret which contains a private key and a certificate into the desired format:
+
+```yaml
+{% include 'filterpem-template-v2-external-secret.yaml' %}
+```
+
+In case you have a secret that contains a (partial) certificate chain you can extract the `leaf`, `intermediate` or `root` certificate(s) using the `filterCertChain` function. See the following example on how to use the `filterPEM` and `filterCertChain` functions together to split the certificate chain into a `tlc.crt` part only containting the leaf certificate and a `ca.crt` part with all the intermediate certificates.
+
+```yaml
+{% include 'filtercertchain-template-v2-external-secret.yaml' %}
+```
+
+## Templating with PushSecret
+
+`PushSecret` templating is much like `ExternalSecrets` templating. In-fact under the hood, it's using the same data structure.
+Which means, anything described in the above should be possible with push secret as well resulting in a templated secret
+created at the provider.
+
+```yaml
+{% include 'template-v2-push-secret.yaml' %}
+```
 
 ## Helper functions
 
@@ -113,17 +158,22 @@ In addition to that you can use over 200+ [sprig functions](http://masterminds.g
 
 <br/>
 
-| Function       | Description                                                                                                                                                                                               |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| pkcs12key      | Extracts all private keys from a PKCS#12 archive and encodes them in **PKCS#8 PEM** format.                                                                                                               |
-| pkcs12keyPass  | Same as `pkcs12key`. Uses the provided password to decrypt the PKCS#12 archive.                                                                                                                           |
-| pkcs12cert     | Extracts all certificates from a PKCS#12 archive and orders them if possible. If disjunct or multiple leaf certs are provided they are returned as-is. <br/> Sort order: `leaf / intermediate(s) / root`. |
-| pkcs12certPass | Same as `pkcs12cert`. Uses the provided password to decrypt the PKCS#12 archive.                                                                                                                          |
-| filterPEM      | Filters PEM blocks with a specific type from a list of PEM blocks.                                                                                                                                        |
-| jwkPublicKeyPem | Takes an json-serialized JWK and returns an PEM block of type `PUBLIC KEY` that contains the public key. [See here](https://golang.org/pkg/crypto/x509/#MarshalPKIXPublicKey) for details. |
+| Function         | Description                                                                                                                                                                                                                  |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| pkcs12key        | Extracts all private keys from a PKCS#12 archive and encodes them in **PKCS#8 PEM** format.                                                                                                                                  |
+| pkcs12keyPass    | Same as `pkcs12key`. Uses the provided password to decrypt the PKCS#12 archive.                                                                                                                                              |
+| pkcs12cert       | Extracts all certificates from a PKCS#12 archive and orders them if possible. If disjunct or multiple leaf certs are provided they are returned as-is. <br/> Sort order: `leaf / intermediate(s) / root`.                    |
+| pkcs12certPass   | Same as `pkcs12cert`. Uses the provided password to decrypt the PKCS#12 archive.                                                                                                                                             |
+| pemToPkcs12      | Takes a PEM encoded certificate and key and creates a base64 encoded PKCS#12 archive.                                                                                                                                         |
+| pemToPkcs12Pass  | Same as `pemToPkcs12`. Uses the provided password to encrypt the PKCS#12 archive.                                                                                                                                            |
+| fullPemToPkcs12      | Takes a PEM encoded certificates chain and key and creates a base64 encoded PKCS#12 archive.                                                                                                                                         |
+| fullPemToPkcs12Pass  | Same as `fullPemToPkcs12`. Uses the provided password to encrypt the PKCS#12 archive.                                                                                                                                            |
+| filterPEM        | Filters PEM blocks with a specific type from a list of PEM blocks.                                                                                                                                                           |
+| filterCertChain  | Filters PEM block(s) with a specific certificate type (`leaf`, `intermediate` or `root`)  from a certificate chain of PEM blocks (PEM blocks with type `CERTIFICATE`). |
+| jwkPublicKeyPem  | Takes an json-serialized JWK and returns an PEM block of type `PUBLIC KEY` that contains the public key. [See here](https://golang.org/pkg/crypto/x509/#MarshalPKIXPublicKey) for details.                                   |
 | jwkPrivateKeyPem | Takes an json-serialized JWK as `string` and returns an PEM block of type `PRIVATE KEY` that contains the private key in PKCS #8 format. [See here](https://golang.org/pkg/crypto/x509/#MarshalPKCS8PrivateKey) for details. |
-| toYaml | Takes an interface, marshals it to yaml. It returns a string, even on marshal error (empty string). |
-| fromYaml | Function converts a YAML document into a map[string]interface{}. |
+| toYaml           | Takes an interface, marshals it to yaml. It returns a string, even on marshal error (empty string).                                                                                                                          |
+| fromYaml         | Function converts a YAML document into a map[string]any.                                                                                                                                                             |
 
 ## Migrating from v1
 

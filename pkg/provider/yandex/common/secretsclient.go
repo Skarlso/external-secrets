@@ -11,15 +11,20 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package common
 
 import (
 	"context"
-	"fmt"
+	"errors"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
+)
+
+const (
+	errNotImplemented = "not implemented"
 )
 
 // https://github.com/external-secrets/external-secrets/issues/644
@@ -36,12 +41,16 @@ func (c *yandexCloudSecretsClient) GetSecret(ctx context.Context, ref esv1beta1.
 	return c.secretGetter.GetSecret(ctx, c.iamToken, ref.Key, ref.Version, ref.Property)
 }
 
-func (c *yandexCloudSecretsClient) DeleteSecret(_ context.Context, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (c *yandexCloudSecretsClient) DeleteSecret(_ context.Context, _ esv1beta1.PushSecretRemoteRef) error {
+	return errors.New(errNotImplemented)
 }
 
-func (c *yandexCloudSecretsClient) PushSecret(_ context.Context, _ []byte, _ *apiextensionsv1.JSON, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (c *yandexCloudSecretsClient) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New(errNotImplemented)
+}
+
+func (c *yandexCloudSecretsClient) PushSecret(_ context.Context, _ *corev1.Secret, _ esv1beta1.PushSecretData) error {
+	return errors.New(errNotImplemented)
 }
 
 func (c *yandexCloudSecretsClient) Validate() (esv1beta1.ValidationResult, error) {
@@ -54,7 +63,7 @@ func (c *yandexCloudSecretsClient) GetSecretMap(ctx context.Context, ref esv1bet
 
 func (c *yandexCloudSecretsClient) GetAllSecrets(_ context.Context, _ esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
 	// TO be implemented
-	return nil, fmt.Errorf("GetAllSecrets not supported")
+	return nil, errors.New(errNotImplemented)
 }
 
 func (c *yandexCloudSecretsClient) Close(_ context.Context) error {

@@ -11,14 +11,18 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package kubernetes
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 
 	authv1 "k8s.io/api/authorization/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	"github.com/external-secrets/external-secrets/pkg/constants"
@@ -26,45 +30,45 @@ import (
 	"github.com/external-secrets/external-secrets/pkg/utils"
 )
 
-func (p *Provider) ValidateStore(store esv1beta1.GenericStore) error {
+func (p *Provider) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
 	storeSpec := store.GetSpec()
 	k8sSpec := storeSpec.Provider.Kubernetes
-	if k8sSpec.Server.CABundle == nil && k8sSpec.Server.CAProvider == nil {
-		return fmt.Errorf("a CABundle or CAProvider is required")
+	if k8sSpec.AuthRef == nil && k8sSpec.Server.CABundle == nil && k8sSpec.Server.CAProvider == nil {
+		return nil, errors.New("a CABundle or CAProvider is required")
 	}
 	if store.GetObjectKind().GroupVersionKind().Kind == esv1beta1.ClusterSecretStoreKind &&
 		k8sSpec.Server.CAProvider != nil &&
 		k8sSpec.Server.CAProvider.Namespace == nil {
-		return fmt.Errorf("CAProvider.namespace must not be empty with ClusterSecretStore")
+		return nil, errors.New("CAProvider.namespace must not be empty with ClusterSecretStore")
 	}
 	if k8sSpec.Auth.Cert != nil {
 		if k8sSpec.Auth.Cert.ClientCert.Name == "" {
-			return fmt.Errorf("ClientCert.Name cannot be empty")
+			return nil, errors.New("ClientCert.Name cannot be empty")
 		}
 		if k8sSpec.Auth.Cert.ClientCert.Key == "" {
-			return fmt.Errorf("ClientCert.Key cannot be empty")
+			return nil, errors.New("ClientCert.Key cannot be empty")
 		}
 		if err := utils.ValidateSecretSelector(store, k8sSpec.Auth.Cert.ClientCert); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if k8sSpec.Auth.Token != nil {
 		if k8sSpec.Auth.Token.BearerToken.Name == "" {
-			return fmt.Errorf("BearerToken.Name cannot be empty")
+			return nil, errors.New("BearerToken.Name cannot be empty")
 		}
 		if k8sSpec.Auth.Token.BearerToken.Key == "" {
-			return fmt.Errorf("BearerToken.Key cannot be empty")
+			return nil, errors.New("BearerToken.Key cannot be empty")
 		}
 		if err := utils.ValidateSecretSelector(store, k8sSpec.Auth.Token.BearerToken); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if k8sSpec.Auth.ServiceAccount != nil {
 		if err := utils.ValidateReferentServiceAccountSelector(store, *k8sSpec.Auth.ServiceAccount); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func (c *Client) Validate() (esv1beta1.ValidationResult, error) {
@@ -86,20 +90,11 @@ func (c *Client) Validate() (esv1beta1.ValidationResult, error) {
 		return esv1beta1.ValidationResultUnknown, fmt.Errorf("could not verify if client is valid: %w", err)
 	}
 	for _, rev := range authReview.Status.ResourceRules {
-		if (contains("secrets", rev.Resources) || contains("*", rev.Resources)) &&
-			(contains("get", rev.Verbs) || contains("*", rev.Verbs)) &&
-			(len(rev.APIGroups) == 0 || (contains("", rev.APIGroups) || contains("*", rev.APIGroups))) {
+		if (slices.Contains(rev.Resources, "secrets") || slices.Contains(rev.Resources, "*")) &&
+			(slices.Contains(rev.Verbs, "get") || slices.Contains(rev.Verbs, "*")) &&
+			(len(rev.APIGroups) == 0 || (slices.Contains(rev.APIGroups, "") || slices.Contains(rev.APIGroups, "*"))) {
 			return esv1beta1.ValidationResultReady, nil
 		}
 	}
-	return esv1beta1.ValidationResultError, fmt.Errorf("client is not allowed to get secrets")
-}
-
-func contains(sub string, args []string) bool {
-	for _, k := range args {
-		if k == sub {
-			return true
-		}
-	}
-	return false
+	return esv1beta1.ValidationResultError, errors.New("client is not allowed to get secrets")
 }

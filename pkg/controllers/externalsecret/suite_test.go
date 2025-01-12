@@ -20,9 +20,8 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"go.uber.org/zap/zapcore"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,6 +34,9 @@ import (
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	genv1alpha1 "github.com/external-secrets/external-secrets/apis/generators/v1alpha1"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 // These tests use Ginkgo (BDD-style Go testing framework). Refer to
@@ -79,6 +81,17 @@ var _ = BeforeSuite(func() {
 		Metrics: server.Options{
 			BindAddress: "0", // avoid port collision when testing
 		},
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				// the client creates a ListWatch for resources that are requested with .Get() or .List()
+				// we disable caching in the production code, so we disable it here as well for consistency
+				// see: https://github.com/external-secrets/external-secrets/issues/721
+				DisableFor: []client.Object{
+					&v1.Secret{},
+					&v1.ConfigMap{},
+				},
+			},
+		},
 	})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -88,8 +101,14 @@ var _ = BeforeSuite(func() {
 	Expect(k8sClient).ToNot(BeNil())
 	Expect(err).ToNot(HaveOccurred())
 
+	// by default, we use a separate cached client for secrets that are managed by the controller
+	// so we should test under the same conditions
+	secretClient, err := BuildManagedSecretClient(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
 	err = (&Reconciler{
-		Client:                    k8sClient,
+		Client:                    k8sManager.GetClient(),
+		SecretClient:              secretClient,
 		RestConfig:                cfg,
 		Scheme:                    k8sManager.GetScheme(),
 		Log:                       ctrl.Log.WithName("controllers").WithName("ExternalSecrets"),

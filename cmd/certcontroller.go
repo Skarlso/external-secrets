@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package cmd
 
 import (
@@ -21,14 +22,19 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap/zapcore"
+	admissionregistration "k8s.io/api/admissionregistration/v1"
 	v1 "k8s.io/api/core/v1"
+	apiextensions "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"github.com/external-secrets/external-secrets/pkg/constants"
 	"github.com/external-secrets/external-secrets/pkg/controllers/crds"
 	"github.com/external-secrets/external-secrets/pkg/controllers/webhookconfig"
 )
@@ -58,6 +64,30 @@ var certcontrollerCmd = &cobra.Command{
 		logger := zap.New(zap.UseFlagOptions(&opts))
 		ctrl.SetLogger(logger)
 
+		// completely disable caching of Secrets and ConfigMaps to save memory
+		// see: https://github.com/external-secrets/external-secrets/issues/721
+		clientCacheDisableFor := make([]client.Object, 0)
+		clientCacheDisableFor = append(clientCacheDisableFor, &v1.Secret{}, &v1.ConfigMap{})
+
+		// in large clusters, the CRDs and ValidatingWebhookConfigurations can take up a lot of memory
+		// see: https://github.com/external-secrets/external-secrets/pull/3588
+		cacheByObject := make(map[client.Object]cache.ByObject)
+		if enablePartialCache {
+			// only cache ValidatingWebhookConfiguration with "external-secrets.io/component=webhook" label
+			cacheByObject[&admissionregistration.ValidatingWebhookConfiguration{}] = cache.ByObject{
+				Label: labels.SelectorFromSet(labels.Set{
+					constants.WellKnownLabelKey: constants.WellKnownLabelValueWebhook,
+				}),
+			}
+
+			// only cache CustomResourceDefinition with "external-secrets.io/component=controller" label
+			cacheByObject[&apiextensions.CustomResourceDefinition{}] = cache.ByObject{
+				Label: labels.SelectorFromSet(labels.Set{
+					constants.WellKnownLabelKey: constants.WellKnownLabelValueController,
+				}),
+			}
+		}
+
 		mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 			Scheme: scheme,
 			Metrics: server.Options{
@@ -69,17 +99,12 @@ var certcontrollerCmd = &cobra.Command{
 			HealthProbeBindAddress: healthzAddr,
 			LeaderElection:         enableLeaderElection,
 			LeaderElectionID:       "crd-certs-controller",
+			Cache: cache.Options{
+				ByObject: cacheByObject,
+			},
 			Client: client.Options{
 				Cache: &client.CacheOptions{
-					DisableFor: []client.Object{
-						// the client creates a ListWatch for all resource kinds that
-						// are requested with .Get().
-						// We want to avoid to cache all secrets or configmaps in memory.
-						// The ES controller uses v1.PartialObjectMetadata for the secrets
-						// that he owns.
-						// see #721
-						&v1.Secret{},
-					},
+					DisableFor: clientCacheDisableFor,
 				},
 			},
 		})
@@ -87,9 +112,17 @@ var certcontrollerCmd = &cobra.Command{
 			setupLog.Error(err, "unable to start manager")
 			os.Exit(1)
 		}
-		crdctrl := crds.New(mgr.GetClient(), mgr.GetScheme(),
+
+		crdctrl := crds.New(mgr.GetClient(), mgr.GetScheme(), mgr.Elected(),
 			ctrl.Log.WithName("controllers").WithName("webhook-certs-updater"),
-			crdRequeueInterval, serviceName, serviceNamespace, secretName, secretNamespace, crdNames)
+			crdRequeueInterval,
+			crds.Opts{
+				SvcName:         serviceName,
+				SvcNamespace:    serviceNamespace,
+				SecretName:      secretName,
+				SecretNamespace: secretNamespace,
+				Resources:       crdNames,
+			})
 		if err := crdctrl.SetupWithManager(mgr, controller.Options{
 			MaxConcurrentReconciles: concurrent,
 		}); err != nil {
@@ -97,10 +130,15 @@ var certcontrollerCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
-		whc := webhookconfig.New(mgr.GetClient(), mgr.GetScheme(),
+		whc := webhookconfig.New(mgr.GetClient(), mgr.GetScheme(), mgr.Elected(),
 			ctrl.Log.WithName("controllers").WithName("webhook-certs-updater"),
-			serviceName, serviceNamespace,
-			secretName, secretNamespace, crdRequeueInterval)
+			webhookconfig.Opts{
+				SvcName:         serviceName,
+				SvcNamespace:    serviceNamespace,
+				SecretName:      secretName,
+				SecretNamespace: secretNamespace,
+				RequeueInterval: crdRequeueInterval,
+			})
 		if err := whc.SetupWithManager(mgr, controller.Options{
 			MaxConcurrentReconciles: concurrent,
 		}); err != nil {
@@ -137,6 +175,8 @@ func init() {
 	certcontrollerCmd.Flags().StringVar(&secretName, "secret-name", "external-secrets-webhook", "Secret to store certs for webhook")
 	certcontrollerCmd.Flags().StringVar(&secretNamespace, "secret-namespace", "default", "namespace of the secret to store certs")
 	certcontrollerCmd.Flags().StringSliceVar(&crdNames, "crd-names", []string{"externalsecrets.external-secrets.io", "clustersecretstores.external-secrets.io", "secretstores.external-secrets.io"}, "CRD names reconciled by the controller")
+	certcontrollerCmd.Flags().BoolVar(&enablePartialCache, "enable-partial-cache", false,
+		"Enable caching of only the relevant CRDs and Webhook configurations in the Informer to improve memory efficiency")
 	certcontrollerCmd.Flags().BoolVar(&enableLeaderElection, "enable-leader-election", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")

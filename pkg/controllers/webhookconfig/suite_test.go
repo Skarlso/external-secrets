@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,6 +31,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	esapi "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var cfg *rest.Config
@@ -84,8 +85,15 @@ var _ = BeforeSuite(func() {
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).ToNot(HaveOccurred())
 	Expect(k8sClient).ToNot(BeNil())
-
-	reconciler = New(k8sClient, k8sManager.GetScheme(), ctrl.Log, ctrlSvcName, ctrlSvcNamespace, ctrlSecretName, ctrlSecretNamespace, time.Second)
+	leaderChan := make(chan struct{})
+	close(leaderChan)
+	reconciler = New(k8sClient, k8sManager.GetScheme(), leaderChan, ctrl.Log, Opts{
+		SvcName:         ctrlSvcName,
+		SvcNamespace:    ctrlSvcNamespace,
+		SecretName:      ctrlSecretName,
+		SecretNamespace: ctrlSecretNamespace,
+		RequeueInterval: time.Second,
+	})
 	reconciler.SetupWithManager(k8sManager, controller.Options{})
 	Expect(err).ToNot(HaveOccurred())
 

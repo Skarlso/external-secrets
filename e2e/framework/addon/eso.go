@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package addon
 
 import (
@@ -24,7 +25,10 @@ type ESO struct {
 	*HelmChart
 }
 
-const installCRDsVar = "installCRDs"
+const (
+	installCRDsVar = "installCRDs"
+	esoImage       = "ghcr.io/external-secrets/external-secrets"
+)
 
 func NewESO(mutators ...MutationFunc) *ESO {
 	eso := &ESO{
@@ -42,12 +46,24 @@ func NewESO(mutators ...MutationFunc) *ESO {
 					Value: os.Getenv("VERSION"),
 				},
 				{
+					Key:   "webhook.image.repository",
+					Value: esoImage,
+				},
+				{
 					Key:   "certController.image.tag",
 					Value: os.Getenv("VERSION"),
 				},
 				{
+					Key:   "certController.image.repository",
+					Value: esoImage,
+				},
+				{
 					Key:   "image.tag",
 					Value: os.Getenv("VERSION"),
+				},
+				{
+					Key:   "image.repository",
+					Value: esoImage,
 				},
 				{
 					Key:   "extraArgs.loglevel",

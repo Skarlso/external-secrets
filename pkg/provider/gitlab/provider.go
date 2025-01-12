@@ -11,16 +11,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package gitlab
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 
-	"github.com/xanzy/go-gitlab"
+	gitlab "gitlab.com/gitlab-org/api/client-go"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
+	"github.com/external-secrets/external-secrets/pkg/constants"
+	"github.com/external-secrets/external-secrets/pkg/metrics"
 	"github.com/external-secrets/external-secrets/pkg/utils"
 )
 
@@ -48,7 +54,7 @@ func (g *Provider) Capabilities() esv1beta1.SecretStoreCapabilities {
 func (g *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, kube kclient.Client, namespace string) (esv1beta1.SecretsClient, error) {
 	storeSpec := store.GetSpec()
 	if storeSpec == nil || storeSpec.Provider == nil || storeSpec.Provider.Gitlab == nil {
-		return nil, fmt.Errorf("no store type or wrong store type")
+		return nil, errors.New("no store type or wrong store type")
 	}
 	storeSpecGitlab := storeSpec.Provider.Gitlab
 
@@ -86,7 +92,7 @@ func (g *gitlabBase) getClient(ctx context.Context, provider *esv1beta1.GitlabPr
 	// in a similar way to extend functionality of the provider
 
 	// Create a new GitLab Client using credentials and options
-	client, err := gitlab.NewClient(string(credentials), opts...)
+	client, err := gitlab.NewClient(credentials, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -94,32 +100,51 @@ func (g *gitlabBase) getClient(ctx context.Context, provider *esv1beta1.GitlabPr
 	return client, nil
 }
 
-func (g *Provider) ValidateStore(store esv1beta1.GenericStore) error {
+func (g *gitlabBase) getVariables(ref esv1beta1.ExternalSecretDataRemoteRef, vopts *gitlab.GetProjectVariableOptions) (*gitlab.ProjectVariable, *gitlab.Response, error) {
+	data, resp, err := g.projectVariablesClient.GetVariable(g.store.ProjectID, ref.Key, vopts)
+	metrics.ObserveAPICall(constants.ProviderGitLab, constants.CallGitLabProjectVariableGet, err)
+	if err != nil {
+		if resp != nil && resp.StatusCode == http.StatusNotFound && !isEmptyOrWildcard(g.store.Environment) {
+			vopts.Filter.EnvironmentScope = "*"
+			data, resp, err = g.projectVariablesClient.GetVariable(g.store.ProjectID, ref.Key, vopts)
+			metrics.ObserveAPICall(constants.ProviderGitLab, constants.CallGitLabProjectVariableGet, err)
+			if err != nil || resp == nil {
+				return nil, nil, fmt.Errorf("error getting variable %s from GitLab: %w", ref.Key, err)
+			}
+		} else {
+			return nil, nil, err
+		}
+	}
+
+	return data, resp, nil
+}
+
+func (g *Provider) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
 	storeSpec := store.GetSpec()
 	gitlabSpec := storeSpec.Provider.Gitlab
 	accessToken := gitlabSpec.Auth.SecretRef.AccessToken
 	err := utils.ValidateSecretSelector(store, accessToken)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if gitlabSpec.ProjectID == "" && len(gitlabSpec.GroupIDs) == 0 {
-		return fmt.Errorf("projectID and groupIDs must not both be empty")
+		return nil, errors.New("projectID and groupIDs must not both be empty")
 	}
 
 	if gitlabSpec.InheritFromGroups && len(gitlabSpec.GroupIDs) > 0 {
-		return fmt.Errorf("defining groupIDs and inheritFromGroups = true is not allowed")
+		return nil, errors.New("defining groupIDs and inheritFromGroups = true is not allowed")
 	}
 
 	if accessToken.Key == "" {
-		return fmt.Errorf("accessToken.key cannot be empty")
+		return nil, errors.New("accessToken.key cannot be empty")
 	}
 
 	if accessToken.Name == "" {
-		return fmt.Errorf("accessToken.name cannot be empty")
+		return nil, errors.New("accessToken.name cannot be empty")
 	}
 
-	return nil
+	return nil, nil
 }
 
 func init() {

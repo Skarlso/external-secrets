@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -33,6 +31,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	esapi "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 )
 
 var cfg *rest.Config
@@ -77,9 +78,17 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 	Expect(k8sClient).ToNot(BeNil())
 
-	rec := New(k8sClient, k8sManager.GetScheme(), log, time.Second*1,
-		"foo", "default", "foo", "default", []string{
-			"secretstores.test.io",
+	leaderChan := make(chan struct{})
+	close(leaderChan)
+	rec := New(k8sClient, k8sManager.GetScheme(), leaderChan, log, time.Second*1,
+		Opts{
+			SvcName:         "foo",
+			SvcNamespace:    "default",
+			SecretName:      "foo",
+			SecretNamespace: "default",
+			Resources: []string{
+				"secretstores.test.io",
+			},
 		})
 	rec.SetupWithManager(k8sManager, controller.Options{})
 	Expect(err).ToNot(HaveOccurred())

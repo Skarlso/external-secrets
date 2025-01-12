@@ -17,201 +17,130 @@ package externalsecret
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
-	// Loading registered providers.
-	_ "github.com/external-secrets/external-secrets/pkg/provider/register"
+	"github.com/external-secrets/external-secrets/pkg/controllers/templating"
 	"github.com/external-secrets/external-secrets/pkg/template"
 	"github.com/external-secrets/external-secrets/pkg/utils"
+
+	_ "github.com/external-secrets/external-secrets/pkg/provider/register" // Loading registered providers.
 )
-
-type Parser struct {
-	exec         template.ExecFunc
-	dataMap      map[string][]byte
-	client       client.Client
-	targetSecret *v1.Secret
-}
-
-func (p *Parser) MergeConfigMap(ctx context.Context, namespace string, tpl esv1beta1.TemplateFrom) error {
-	if tpl.ConfigMap == nil {
-		return nil
-	}
-	var cm v1.ConfigMap
-	err := p.client.Get(ctx, types.NamespacedName{
-		Name:      tpl.ConfigMap.Name,
-		Namespace: namespace,
-	}, &cm)
-	if err != nil {
-		return err
-	}
-	for _, k := range tpl.ConfigMap.Items {
-		val, ok := cm.Data[k.Key]
-		out := make(map[string][]byte)
-		if !ok {
-			return fmt.Errorf(errTplCMMissingKey, tpl.ConfigMap.Name, k.Key)
-		}
-		switch k.TemplateAs {
-		case esv1beta1.TemplateScopeValues:
-			out[k.Key] = []byte(val)
-		case esv1beta1.TemplateScopeKeysAndValues:
-			out[val] = []byte(val)
-		}
-		err = p.exec(out, p.dataMap, k.TemplateAs, tpl.Target, p.targetSecret)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *Parser) MergeSecret(ctx context.Context, namespace string, tpl esv1beta1.TemplateFrom) error {
-	if tpl.Secret == nil {
-		return nil
-	}
-	var sec v1.Secret
-	err := p.client.Get(ctx, types.NamespacedName{
-		Name:      tpl.Secret.Name,
-		Namespace: namespace,
-	}, &sec)
-	if err != nil {
-		return err
-	}
-	for _, k := range tpl.Secret.Items {
-		val, ok := sec.Data[k.Key]
-		if !ok {
-			return fmt.Errorf(errTplSecMissingKey, tpl.Secret.Name, k.Key)
-		}
-		out := make(map[string][]byte)
-		switch k.TemplateAs {
-		case esv1beta1.TemplateScopeValues:
-			out[k.Key] = val
-		case esv1beta1.TemplateScopeKeysAndValues:
-			out[string(val)] = val
-		}
-		err = p.exec(out, p.dataMap, k.TemplateAs, tpl.Target, p.targetSecret)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *Parser) MergeLiteral(_ context.Context, tpl esv1beta1.TemplateFrom) error {
-	if tpl.Literal == nil {
-		return nil
-	}
-	out := make(map[string][]byte)
-	out[*tpl.Literal] = []byte(*tpl.Literal)
-	return p.exec(out, p.dataMap, esv1beta1.TemplateScopeKeysAndValues, tpl.Target, p.targetSecret)
-}
-
-func (p *Parser) MergeTemplateFrom(ctx context.Context, es *esv1beta1.ExternalSecret) error {
-	if es.Spec.Target.Template == nil {
-		return nil
-	}
-	for _, tpl := range es.Spec.Target.Template.TemplateFrom {
-		err := p.MergeConfigMap(ctx, es.Namespace, tpl)
-		if err != nil {
-			return err
-		}
-		err = p.MergeSecret(ctx, es.Namespace, tpl)
-		if err != nil {
-			return err
-		}
-		err = p.MergeLiteral(ctx, tpl)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *Parser) MergeMap(tplMap map[string]string, target esv1beta1.TemplateTarget) error {
-	byteMap := make(map[string][]byte)
-	for k, v := range tplMap {
-		byteMap[k] = []byte(v)
-	}
-	err := p.exec(byteMap, p.dataMap, esv1beta1.TemplateScopeValues, target, p.targetSecret)
-	if err != nil {
-		return fmt.Errorf(errExecTpl, err)
-	}
-	return nil
-}
 
 // merge template in the following order:
 // * template.Data (highest precedence)
-// * template.templateFrom
-// * secret via es.data or es.dataFrom.
+// * template.TemplateFrom
+// * secret via es.data or es.dataFrom (if template.MergePolicy is Merge, or there is no template)
+// * existing secret keys (if CreationPolicy is Merge).
 func (r *Reconciler) applyTemplate(ctx context.Context, es *esv1beta1.ExternalSecret, secret *v1.Secret, dataMap map[string][]byte) error {
-	setMetadata(secret, es)
+	// update metadata (labels, annotations) of the secret
+	if err := setMetadata(secret, es); err != nil {
+		return err
+	}
+
+	// we only keep existing keys if creation policy is Merge, otherwise we clear the secret
+	if es.Spec.Target.CreationPolicy != esv1beta1.CreatePolicyMerge {
+		secret.Data = make(map[string][]byte)
+	}
 
 	// no template: copy data and return
 	if es.Spec.Target.Template == nil {
-		secret.Data = dataMap
+		maps.Insert(secret.Data, maps.All(dataMap))
 		return nil
 	}
-	// Merge Policy should merge secrets
-	if es.Spec.Target.Template.MergePolicy == esv1beta1.MergePolicyMerge {
-		for k, v := range dataMap {
-			secret.Data[k] = v
-		}
+
+	// set the secret type if it is defined in the template, otherwise keep the existing type
+	if es.Spec.Target.Template.Type != "" {
+		secret.Type = es.Spec.Target.Template.Type
 	}
+
+	// when TemplateMergePolicy is Merge, or there is no data template, we include the keys from `dataMap`
+	noTemplate := len(es.Spec.Target.Template.Data) == 0 && len(es.Spec.Target.Template.TemplateFrom) == 0
+	if es.Spec.Target.Template.MergePolicy == esv1beta1.MergePolicyMerge || noTemplate {
+		maps.Insert(secret.Data, maps.All(dataMap))
+	}
+
 	execute, err := template.EngineForVersion(es.Spec.Target.Template.EngineVersion)
 	if err != nil {
 		return err
 	}
 
-	p := Parser{
-		client:       r.Client,
-		targetSecret: secret,
-		dataMap:      dataMap,
-		exec:         execute,
+	p := templating.Parser{
+		Client:       r.Client,
+		TargetSecret: secret,
+		DataMap:      dataMap,
+		Exec:         execute,
 	}
+
 	// apply templates defined in template.templateFrom
-	err = p.MergeTemplateFrom(ctx, es)
+	err = p.MergeTemplateFrom(ctx, es.Namespace, es.Spec.Target.Template)
 	if err != nil {
 		return fmt.Errorf(errFetchTplFrom, err)
 	}
-	// explicitly defined template.Data takes precedence over templateFrom
+
+	// apply data templates
+	// NOTE: explicitly defined template.data templates take precedence over templateFrom
 	err = p.MergeMap(es.Spec.Target.Template.Data, esv1beta1.TemplateTargetData)
 	if err != nil {
 		return fmt.Errorf(errExecTpl, err)
 	}
 
-	// get template data for labels
+	// apply templates for labels
+	// NOTE: this only works for v2 templates
 	err = p.MergeMap(es.Spec.Target.Template.Metadata.Labels, esv1beta1.TemplateTargetLabels)
 	if err != nil {
 		return fmt.Errorf(errExecTpl, err)
 	}
-	// get template data for annotations
+
+	// apply template for annotations
+	// NOTE: this only works for v2 templates
 	err = p.MergeMap(es.Spec.Target.Template.Metadata.Annotations, esv1beta1.TemplateTargetAnnotations)
 	if err != nil {
 		return fmt.Errorf(errExecTpl, err)
 	}
-	// if no data was provided by template fallback
-	// to value from the provider
-	if len(es.Spec.Target.Template.Data) == 0 && len(es.Spec.Target.Template.TemplateFrom) == 0 {
-		secret.Data = dataMap
-	}
+
 	return nil
 }
 
 // setMetadata sets Labels and Annotations to the given secret.
-func setMetadata(secret *v1.Secret, externalSecret *esv1beta1.ExternalSecret) {
-	// It is safe to override the metadata since the Server-Side Apply merges those fields if necessary
-	secret.ObjectMeta.Labels = make(map[string]string)
-	secret.ObjectMeta.Annotations = make(map[string]string)
-	if externalSecret.Spec.Target.Template == nil {
-		utils.MergeStringMap(secret.ObjectMeta.Labels, externalSecret.ObjectMeta.Labels)
-		utils.MergeStringMap(secret.ObjectMeta.Annotations, externalSecret.ObjectMeta.Annotations)
-		return
+func setMetadata(secret *v1.Secret, es *esv1beta1.ExternalSecret) error {
+	// ensure that Labels and Annotations are not nil
+	// so it is safe to merge them
+	if secret.Labels == nil {
+		secret.Labels = make(map[string]string)
 	}
-	// if template is defined: use those labels/annotations
-	secret.Type = externalSecret.Spec.Target.Template.Type
-	utils.MergeStringMap(secret.ObjectMeta.Labels, externalSecret.Spec.Target.Template.Metadata.Labels)
-	utils.MergeStringMap(secret.ObjectMeta.Annotations, externalSecret.Spec.Target.Template.Metadata.Annotations)
+	if secret.Annotations == nil {
+		secret.Annotations = make(map[string]string)
+	}
+
+	// remove any existing labels managed by this external secret
+	// this is to ensure that we don't have any stale labels
+	labelKeys, err := templating.GetManagedLabelKeys(secret, es.Name)
+	if err != nil {
+		return err
+	}
+	for _, key := range labelKeys {
+		delete(secret.ObjectMeta.Labels, key)
+	}
+	annotationKeys, err := templating.GetManagedAnnotationKeys(secret, es.Name)
+	if err != nil {
+		return err
+	}
+	for _, key := range annotationKeys {
+		delete(secret.ObjectMeta.Annotations, key)
+	}
+
+	// if no template is defined, copy labels and annotations from the ExternalSecret
+	if es.Spec.Target.Template == nil {
+		utils.MergeStringMap(secret.ObjectMeta.Labels, es.ObjectMeta.Labels)
+		utils.MergeStringMap(secret.ObjectMeta.Annotations, es.ObjectMeta.Annotations)
+		return nil
+	}
+
+	// copy labels and annotations from the template
+	utils.MergeStringMap(secret.ObjectMeta.Labels, es.Spec.Target.Template.Metadata.Labels)
+	utils.MergeStringMap(secret.ObjectMeta.Annotations, es.Spec.Target.Template.Metadata.Annotations)
+	return nil
 }

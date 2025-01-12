@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package constants
 
 const (
@@ -22,6 +23,7 @@ const (
 	CallAWSSMCreateSecret        = "CreateSecret"
 	CallAWSSMPutSecretValue      = "PutSecretValue"
 	CallAWSSMListSecrets         = "ListSecrets"
+	CallAWSSMBatchGetSecretValue = "BatchGetSecretValue"
 
 	ProviderAWSPS                = "AWS/ParameterStore"
 	CallAWSPSGetParameter        = "GetParameter"
@@ -35,6 +37,7 @@ const (
 	CallAzureKVDeleteKey         = "DeleteKey"
 	CallAzureKVImportKey         = "ImportKey"
 	CallAzureKVGetSecret         = "GetSecret"
+	CallAzureKVGetSecrets        = "GetSecrets"
 	CallAzureKVDeleteSecret      = "DeleteSecret"
 	CallAzureKVGetCertificate    = "GetCertificate"
 	CallAzureKVDeleteCertificate = "DeleteCertificate"
@@ -84,6 +87,22 @@ const (
 	CallGitLabGroupGetVariable     = "GroupVariableGet"
 	CallGitLabGroupListVariables   = "GroupVariablesList"
 
+	ProviderAKEYLESSSM                  = "AKEYLESSLESS/SecretsManager"
+	CallAKEYLESSSMGetSecretValue        = "GetSecretValue"
+	CallAKEYLESSSMDescribeItem          = "DescribeItem"
+	CallAKEYLESSSMListItems             = "ListItems"
+	CallAKEYLESSSMAuth                  = "Auth"
+	CallAKEYLESSSMGetRotatedSecretValue = "GetRotatedSecretValue"
+	CallAKEYLESSSMGetCertificateValue   = "GetCertificateValue"
+	CallAKEYLESSSMGetDynamicSecretValue = "GetDynamicSecretsValue"
+	CallAKEYLESSSMCreateSecret          = "CreateSecret"
+	CallAKEYLESSSMUpdateSecretVal       = "UpdateSecretVal"
+	CallAKEYLESSSMDeleteItem            = "DeleteItem"
+
 	StatusError   = "error"
 	StatusSuccess = "success"
+
+	WellKnownLabelKey             = "external-secrets.io/component"
+	WellKnownLabelValueController = "controller"
+	WellKnownLabelValueWebhook    = "webhook"
 )

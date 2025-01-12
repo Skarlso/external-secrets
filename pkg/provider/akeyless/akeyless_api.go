@@ -35,14 +35,25 @@ import (
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	esmeta "github.com/external-secrets/external-secrets/apis/meta/v1"
+	"github.com/external-secrets/external-secrets/pkg/constants"
+	"github.com/external-secrets/external-secrets/pkg/metrics"
+	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 )
 
-var apiErr akeyless.GenericOpenAPIError
+var (
+	apiErr            akeyless.GenericOpenAPIError
+	ErrItemNotExists  = errors.New("item does not exist")
+	ErrTokenNotExists = errors.New("token does not exist")
+)
 
 const DefServiceAccountFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
-func (a *akeylessBase) GetToken(accessID, accType, accTypeParam string, k8sAuth *esv1beta1.AkeylessKubernetesAuth) (string, error) {
-	ctx := context.Background()
+type Tokener interface {
+	SetToken(v string)
+	SetUidToken(v string)
+}
+
+func (a *akeylessBase) GetToken(ctx context.Context, accessID, accType, accTypeParam string, k8sAuth *esv1beta1.AkeylessKubernetesAuth) (string, error) {
 	authBody := akeyless.NewAuthWithDefaults()
 	authBody.AccessId = akeyless.PtrString(accessID)
 	if accType == "api_key" || accType == "access_key" {
@@ -67,51 +78,71 @@ func (a *akeylessBase) GetToken(accessID, accType, accTypeParam string, k8sAuth 
 	}
 
 	authOut, res, err := a.RestAPI.Auth(ctx).Body(*authBody).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMAuth, err)
+	if errors.As(err, &apiErr) {
+		return "", fmt.Errorf("authentication failed: %v", string(apiErr.Body()))
+	}
 	if err != nil {
-		if errors.As(err, &apiErr) {
-			return "", fmt.Errorf("authentication failed: %v", string(apiErr.Body()))
-		}
 		return "", fmt.Errorf("authentication failed: %w", err)
 	}
 	defer res.Body.Close()
-
 	token := authOut.GetToken()
 	return token, nil
 }
 
-func (a *akeylessBase) GetSecretByType(ctx context.Context, secretName, token string, version int32) (string, error) {
-	item, err := a.DescribeItem(ctx, secretName, token)
+func (a *akeylessBase) GetSecretByType(ctx context.Context, secretName string, version int32) (string, error) {
+	item, err := a.DescribeItem(ctx, secretName)
 	if err != nil {
 		return "", err
 	}
+	if _, ok := item.GetItemNameOk(); !ok {
+		return "", ErrItemNotExists
+	}
 	secretType := item.GetItemType()
-
 	switch secretType {
 	case "STATIC_SECRET":
-		return a.GetStaticSecret(ctx, secretName, token, version)
+		return a.GetStaticSecret(ctx, secretName, version)
 	case "DYNAMIC_SECRET":
-		return a.GetDynamicSecrets(ctx, secretName, token)
+		return a.GetDynamicSecrets(ctx, secretName)
 	case "ROTATED_SECRET":
-		return a.GetRotatedSecrets(ctx, secretName, token, version)
+		return a.GetRotatedSecrets(ctx, secretName, version)
+	case "CERTIFICATE":
+		return a.GetCertificate(ctx, secretName, version)
 	default:
 		return "", fmt.Errorf("invalid item type: %v", secretType)
 	}
 }
 
-func (a *akeylessBase) DescribeItem(ctx context.Context, itemName, token string) (*akeyless.Item, error) {
+func SetBodyToken(t Tokener, ctx context.Context) error {
+	token, ok := ctx.Value(aKeylessToken).(string)
+	if !ok {
+		return ErrTokenNotExists
+	}
+	if strings.HasPrefix(token, "u-") {
+		t.SetUidToken(token)
+	} else {
+		t.SetToken(token)
+	}
+	return nil
+}
+
+func (a *akeylessBase) DescribeItem(ctx context.Context, itemName string) (*akeyless.Item, error) {
 	body := akeyless.DescribeItem{
 		Name: itemName,
 	}
-	if strings.HasPrefix(token, "u-") {
-		body.UidToken = &token
-	} else {
-		body.Token = &token
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return nil, err
 	}
 	gsvOut, res, err := a.RestAPI.DescribeItem(ctx).Body(body).Execute()
-	if err != nil {
-		if errors.As(err, &apiErr) {
-			return nil, fmt.Errorf("can't describe item: %v", string(apiErr.Body()))
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMDescribeItem, err)
+	if errors.As(err, &apiErr) {
+		var item *Item
+		err = json.Unmarshal(apiErr.Body(), &item)
+		if err != nil {
+			return nil, fmt.Errorf("can't describe item: %v, error: %v", itemName, string(apiErr.Body()))
 		}
+	}
+	if err != nil {
 		return nil, fmt.Errorf("can't describe item: %w", err)
 	}
 	defer res.Body.Close()
@@ -119,99 +150,109 @@ func (a *akeylessBase) DescribeItem(ctx context.Context, itemName, token string)
 	return &gsvOut, nil
 }
 
-func (a *akeylessBase) GetRotatedSecrets(ctx context.Context, secretName, token string, version int32) (string, error) {
+func (a *akeylessBase) GetCertificate(ctx context.Context, certificateName string, version int32) (string, error) {
+	body := akeyless.GetCertificateValue{
+		Name:    certificateName,
+		Version: &version,
+	}
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return "", err
+	}
+	gcvOut, res, err := a.RestAPI.GetCertificateValue(ctx).Body(body).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMGetCertificateValue, err)
+	if errors.As(err, &apiErr) {
+		return "", fmt.Errorf("can't get certificate value: %v", string(apiErr.Body()))
+	}
+	if err != nil {
+		return "", fmt.Errorf("can't get certificate value: %w", err)
+	}
+	defer res.Body.Close()
+
+	out, err := json.Marshal(gcvOut)
+	if err != nil {
+		return "", fmt.Errorf("can't marshal certificate value: %w", err)
+	}
+
+	return string(out), nil
+}
+
+func (a *akeylessBase) GetRotatedSecrets(ctx context.Context, secretName string, version int32) (string, error) {
 	body := akeyless.GetRotatedSecretValue{
 		Names:   secretName,
 		Version: &version,
 	}
-	if strings.HasPrefix(token, "u-") {
-		body.UidToken = &token
-	} else {
-		body.Token = &token
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return "", err
 	}
-
 	gsvOut, res, err := a.RestAPI.GetRotatedSecretValue(ctx).Body(body).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMGetRotatedSecretValue, err)
+	if errors.As(err, &apiErr) {
+		return "", fmt.Errorf("can't get rotated secret value: %v", string(apiErr.Body()))
+	}
 	if err != nil {
-		if errors.As(err, &apiErr) {
-			return "", fmt.Errorf("can't get rotated secret value: %v", string(apiErr.Body()))
-		}
 		return "", fmt.Errorf("can't get rotated secret value: %w", err)
 	}
 	defer res.Body.Close()
-
 	valI, ok := gsvOut["value"]
+	var out []byte
 	if ok {
-		val, convert := valI.(map[string]interface{})
+		val, convert := valI.(map[string]any)
 		if !convert {
-			return "", fmt.Errorf("failure converting key from gsvOut")
+			return "", errors.New("failure converting key from gsvOut")
 		}
 		if _, ok := val["payload"]; ok {
 			return fmt.Sprintf("%v", val["payload"]), nil
 		} else if _, ok := val["target_value"]; ok {
-			out, err := json.Marshal(val["target_value"])
-			if err != nil {
-				return "", fmt.Errorf("can't marshal rotated secret value: %w", err)
-			}
-			return string(out), nil
+			out, err = json.Marshal(val["target_value"])
 		} else {
-			out, err := json.Marshal(val)
-			if err != nil {
-				return "", fmt.Errorf("can't marshal rotated secret value: %w", err)
-			}
-			return string(out), nil
+			out, err = json.Marshal(val)
 		}
+	} else {
+		out, err = json.Marshal(gsvOut)
 	}
-	out, err := json.Marshal(gsvOut)
 	if err != nil {
 		return "", fmt.Errorf("can't marshal rotated secret value: %w", err)
 	}
 	return string(out), nil
 }
 
-func (a *akeylessBase) GetDynamicSecrets(ctx context.Context, secretName, token string) (string, error) {
+func (a *akeylessBase) GetDynamicSecrets(ctx context.Context, secretName string) (string, error) {
 	body := akeyless.GetDynamicSecretValue{
 		Name: secretName,
 	}
-	if strings.HasPrefix(token, "u-") {
-		body.UidToken = &token
-	} else {
-		body.Token = &token
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return "", err
 	}
-
 	gsvOut, res, err := a.RestAPI.GetDynamicSecretValue(ctx).Body(body).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMGetDynamicSecretValue, err)
+	if errors.As(err, &apiErr) {
+		return "", fmt.Errorf("can't get dynamic secret value: %v", string(apiErr.Body()))
+	}
 	if err != nil {
-		if errors.As(err, &apiErr) {
-			return "", fmt.Errorf("can't get dynamic secret value: %v", string(apiErr.Body()))
-		}
 		return "", fmt.Errorf("can't get dynamic secret value: %w", err)
 	}
 	defer res.Body.Close()
-
 	out, err := json.Marshal(gsvOut)
 	if err != nil {
 		return "", fmt.Errorf("can't marshal dynamic secret value: %w", err)
 	}
-
 	return string(out), nil
 }
 
-func (a *akeylessBase) GetStaticSecret(ctx context.Context, secretName, token string, version int32) (string, error) {
-	gsvBody := akeyless.GetSecretValue{
+func (a *akeylessBase) GetStaticSecret(ctx context.Context, secretName string, version int32) (string, error) {
+	body := akeyless.GetSecretValue{
 		Names:   []string{secretName},
 		Version: &version,
 	}
-
-	if strings.HasPrefix(token, "u-") {
-		gsvBody.UidToken = &token
-	} else {
-		gsvBody.Token = &token
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return "", err
 	}
-
-	gsvOut, res, err := a.RestAPI.GetSecretValue(ctx).Body(gsvBody).Execute()
+	gsvOut, res, err := a.RestAPI.GetSecretValue(ctx).Body(body).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMGetSecretValue, err)
+	if errors.As(err, &apiErr) {
+		return "", fmt.Errorf("can't get secret value: %v", string(apiErr.Body()))
+	}
 	if err != nil {
-		if errors.As(err, &apiErr) {
-			return "", fmt.Errorf("can't get secret value: %v", string(apiErr.Body()))
-		}
 		return "", fmt.Errorf("can't get secret value: %w", err)
 	}
 	defer res.Body.Close()
@@ -219,7 +260,6 @@ func (a *akeylessBase) GetStaticSecret(ctx context.Context, secretName, token st
 	if !ok {
 		return "", fmt.Errorf("can't get secret: %v", secretName)
 	}
-
 	return val, nil
 }
 
@@ -240,30 +280,27 @@ func (a *akeylessBase) getCloudID(provider, accTypeParam string) (string, error)
 	return cloudID, err
 }
 
-func (a *akeylessBase) ListSecrets(ctx context.Context, path, tag, token string) ([]string, error) {
+func (a *akeylessBase) ListSecrets(ctx context.Context, path, tag string) ([]string, error) {
 	secretTypes := &[]string{"static-secret", "dynamic-secret", "rotated-secret"}
 	MinimalView := true
 	if tag != "" {
 		MinimalView = false
 	}
-	gsvBody := akeyless.ListItems{
+	body := akeyless.ListItems{
 		Filter:      &path,
 		Type:        secretTypes,
 		MinimalView: &MinimalView,
 		Tag:         &tag,
 	}
-
-	if strings.HasPrefix(token, "u-") {
-		gsvBody.UidToken = &token
-	} else {
-		gsvBody.Token = &token
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return nil, err
 	}
-
-	lipOut, res, err := a.RestAPI.ListItems(ctx).Body(gsvBody).Execute()
+	lipOut, res, err := a.RestAPI.ListItems(ctx).Body(body).Execute()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMListItems, err)
+	if errors.As(err, &apiErr) {
+		return nil, fmt.Errorf("can't get secrets list: %v", string(apiErr.Body()))
+	}
 	if err != nil {
-		if errors.As(err, &apiErr) {
-			return nil, fmt.Errorf("can't get secrets list: %v", string(apiErr.Body()))
-		}
 		return nil, fmt.Errorf("error on get secrets list: %w", err)
 	}
 	defer res.Body.Close()
@@ -280,34 +317,79 @@ func (a *akeylessBase) ListSecrets(ctx context.Context, path, tag, token string)
 	return listNames, nil
 }
 
-func (a *akeylessBase) getK8SServiceAccountJWT(ctx context.Context, kubernetesAuth *esv1beta1.AkeylessKubernetesAuth) (string, error) {
-	if kubernetesAuth != nil {
-		if kubernetesAuth.ServiceAccountRef != nil {
-			// Kubernetes <v1.24 fetch token via ServiceAccount.Secrets[]
-			jwt, err := a.getJWTFromServiceAccount(ctx, kubernetesAuth.ServiceAccountRef)
-			if jwt != "" {
-				return jwt, err
-			}
-			// Kubernetes >=v1.24: fetch token via TokenRequest API
-			jwt, err = a.getJWTfromServiceAccountToken(ctx, *kubernetesAuth.ServiceAccountRef, nil, 600)
-			if err != nil {
-				return "", err
-			}
-			return jwt, nil
-		} else if kubernetesAuth.SecretRef != nil {
-			tokenRef := kubernetesAuth.SecretRef
-			if tokenRef.Key == "" {
-				tokenRef = kubernetesAuth.SecretRef.DeepCopy()
-				tokenRef.Key = "token"
-			}
-			jwt, err := a.secretKeyRef(ctx, tokenRef)
-			if err != nil {
-				return "", err
-			}
-			return jwt, nil
-		}
+func (a *akeylessBase) CreateSecret(ctx context.Context, remoteKey, data string) error {
+	body := akeyless.CreateSecret{
+		Name:  remoteKey,
+		Value: data,
+		Tags:  &[]string{extSecretManagedTag},
 	}
-	return readK8SServiceAccountJWT()
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return err
+	}
+	_, res, err := a.RestAPI.CreateSecret(ctx).Body(body).Execute()
+	defer res.Body.Close()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMCreateSecret, err)
+	return err
+}
+
+func (a *akeylessBase) UpdateSecret(ctx context.Context, remoteKey, data string) error {
+	body := akeyless.UpdateSecretVal{
+		Name:  remoteKey,
+		Value: data,
+	}
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return err
+	}
+	_, res, err := a.RestAPI.UpdateSecretVal(ctx).Body(body).Execute()
+	defer res.Body.Close()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMUpdateSecretVal, err)
+	return err
+}
+
+func (a *akeylessBase) DeleteSecret(ctx context.Context, remoteKey string) error {
+	body := akeyless.DeleteItem{
+		Name: remoteKey,
+	}
+	if err := SetBodyToken(&body, ctx); err != nil {
+		return err
+	}
+	_, res, err := a.RestAPI.DeleteItem(ctx).Body(body).Execute()
+	defer res.Body.Close()
+	metrics.ObserveAPICall(constants.ProviderAKEYLESSSM, constants.CallAKEYLESSSMDeleteItem, err)
+	return err
+}
+
+func (a *akeylessBase) getK8SServiceAccountJWT(ctx context.Context, kubernetesAuth *esv1beta1.AkeylessKubernetesAuth) (string, error) {
+	if kubernetesAuth == nil {
+		return readK8SServiceAccountJWT()
+	}
+
+	switch {
+	case kubernetesAuth.ServiceAccountRef != nil:
+		jwt, err := a.getJWTFromServiceAccount(ctx, kubernetesAuth.ServiceAccountRef)
+		if jwt != "" {
+			return jwt, err
+		}
+		// Kubernetes >=v1.24: fetch token via TokenRequest API
+		jwt, err = a.getJWTfromServiceAccountToken(ctx, *kubernetesAuth.ServiceAccountRef, nil, 600)
+		if err != nil {
+			return "", err
+		}
+		return jwt, nil
+	case kubernetesAuth.SecretRef != nil:
+		tokenRef := kubernetesAuth.SecretRef
+		if tokenRef.Key == "" {
+			tokenRef = kubernetesAuth.SecretRef.DeepCopy()
+			tokenRef.Key = "token"
+		}
+		jwt, err := resolvers.SecretKeyRef(ctx, a.kube, a.storeKind, a.namespace, tokenRef)
+		if err != nil {
+			return "", err
+		}
+		return jwt, nil
+	}
+
+	return "", fmt.Errorf("can't determine k8s service account jwt")
 }
 
 func (a *akeylessBase) getJWTFromServiceAccount(ctx context.Context, serviceAccountRef *esmeta.ServiceAccountSelector) (string, error) {
@@ -328,7 +410,7 @@ func (a *akeylessBase) getJWTFromServiceAccount(ctx context.Context, serviceAcco
 		return "", fmt.Errorf(errGetKubeSASecrets, ref.Name)
 	}
 	for _, tokenRef := range serviceAccount.Secrets {
-		retval, err := a.secretKeyRef(ctx, &esmeta.SecretKeySelector{
+		token, err := resolvers.SecretKeyRef(ctx, a.kube, a.storeKind, a.namespace, &esmeta.SecretKeySelector{
 			Name:      tokenRef.Name,
 			Namespace: &ref.Namespace,
 			Key:       "token",
@@ -337,34 +419,9 @@ func (a *akeylessBase) getJWTFromServiceAccount(ctx context.Context, serviceAcco
 			continue
 		}
 
-		return retval, nil
+		return token, nil
 	}
 	return "", fmt.Errorf(errGetKubeSANoToken, ref.Name)
-}
-
-func (a *akeylessBase) secretKeyRef(ctx context.Context, secretRef *esmeta.SecretKeySelector) (string, error) {
-	secret := &corev1.Secret{}
-	ref := types.NamespacedName{
-		Namespace: a.namespace,
-		Name:      secretRef.Name,
-	}
-	if (a.storeKind == esv1beta1.ClusterSecretStoreKind) &&
-		(secretRef.Namespace != nil) {
-		ref.Namespace = *secretRef.Namespace
-	}
-	err := a.kube.Get(ctx, ref, secret)
-	if err != nil {
-		return "", fmt.Errorf(errGetKubeSecret, ref.Name, err)
-	}
-
-	keyBytes, ok := secret.Data[secretRef.Key]
-	if !ok {
-		return "", fmt.Errorf(errSecretKeyFmt, secretRef.Key)
-	}
-
-	value := string(keyBytes)
-	valueStr := strings.TrimSpace(value)
-	return valueStr, nil
 }
 
 func (a *akeylessBase) getJWTfromServiceAccountToken(ctx context.Context, serviceAccountRef esmeta.ServiceAccountSelector, additionalAud []string, expirationSeconds int64) (string, error) {

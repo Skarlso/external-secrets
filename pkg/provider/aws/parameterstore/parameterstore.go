@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package parameterstore
 
 import (
@@ -18,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -26,8 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/tidwall/gjson"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	utilpointer "k8s.io/utils/ptr"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
@@ -35,6 +37,15 @@ import (
 	"github.com/external-secrets/external-secrets/pkg/find"
 	"github.com/external-secrets/external-secrets/pkg/metrics"
 	"github.com/external-secrets/external-secrets/pkg/provider/aws/util"
+	"github.com/external-secrets/external-secrets/pkg/utils"
+)
+
+// Declares metadata information for pushing secrets to AWS Parameter Store.
+const (
+	pushSecretType  = "parameterStoreType"
+	storeTypeString = "String"
+	storeKeyID      = "parameterStoreKeyID"
+	pushSecretKeyID = "keyID"
 )
 
 // https://github.com/external-secrets/external-secrets/issues/644
@@ -50,6 +61,7 @@ type ParameterStore struct {
 	sess         *session.Session
 	client       PMInterface
 	referentAuth bool
+	prefix       string
 }
 
 // PMInterface is a subset of the parameterstore api.
@@ -69,11 +81,12 @@ const (
 )
 
 // New constructs a ParameterStore Provider that is specific to a store.
-func New(sess *session.Session, cfg *aws.Config, referentAuth bool) (*ParameterStore, error) {
+func New(sess *session.Session, cfg *aws.Config, prefix string, referentAuth bool) (*ParameterStore, error) {
 	return &ParameterStore{
 		sess:         sess,
 		referentAuth: referentAuth,
 		client:       ssm.New(sess, cfg),
+		prefix:       prefix,
 	}, nil
 }
 
@@ -94,8 +107,8 @@ func (pm *ParameterStore) getTagsByName(ctx aws.Context, ref *ssm.GetParameterOu
 	return data.TagList, nil
 }
 
-func (pm *ParameterStore) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushRemoteRef) error {
-	secretName := remoteRef.GetRemoteKey()
+func (pm *ParameterStore) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushSecretRemoteRef) error {
+	secretName := pm.prefix + remoteRef.GetRemoteKey()
 	secretValue := ssm.GetParameterInput{
 		Name: &secretName,
 	}
@@ -131,22 +144,56 @@ func (pm *ParameterStore) DeleteSecret(ctx context.Context, remoteRef esv1beta1.
 	return nil
 }
 
-func (pm *ParameterStore) PushSecret(ctx context.Context, value []byte, _ *apiextensionsv1.JSON, remoteRef esv1beta1.PushRemoteRef) error {
-	parameterType := "String"
-	overwrite := true
+func (pm *ParameterStore) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New("not implemented")
+}
 
-	stringValue := string(value)
-	secretName := remoteRef.GetRemoteKey()
+func (pm *ParameterStore) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1beta1.PushSecretData) error {
+	var (
+		value []byte
+		err   error
+	)
 
+	parameterTypeFormat, err := utils.FetchValueFromMetadata(pushSecretType, data.GetMetadata(), storeTypeString)
+	if err != nil {
+		return fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	parameterKeyIDFormat, err := utils.FetchValueFromMetadata(storeKeyID, data.GetMetadata(), pushSecretKeyID)
+	if err != nil {
+		return fmt.Errorf("failed to parse metadata: %w", err)
+	}
+
+	if parameterKeyIDFormat == "keyID" || parameterKeyIDFormat == "" {
+		parameterKeyIDFormat = "alias/aws/ssm"
+	}
+
+	key := data.GetSecretKey()
+
+	if key == "" {
+		value, err = utils.JSONMarshal(secret.Data)
+		if err != nil {
+			return fmt.Errorf("failed to serialize secret content as JSON: %w", err)
+		}
+	} else {
+		value = secret.Data[key]
+	}
+
+	secretName := pm.prefix + data.GetRemoteKey()
 	secretRequest := ssm.PutParameterInput{
-		Name:      &secretName,
-		Value:     &stringValue,
-		Type:      &parameterType,
-		Overwrite: &overwrite,
+		Name:      ptr.To(pm.prefix + data.GetRemoteKey()),
+		Value:     ptr.To(string(value)),
+		Type:      ptr.To(parameterTypeFormat),
+		Overwrite: ptr.To(true),
+	}
+
+	if parameterTypeFormat == "SecureString" {
+		secretRequest.KeyId = &parameterKeyIDFormat
 	}
 
 	secretValue := ssm.GetParameterInput{
-		Name: &secretName,
+		Name:           &secretName,
+		WithDecryption: aws.Bool(true),
 	}
 
 	existing, err := pm.client.GetParameterWithContext(ctx, &secretValue)
@@ -159,23 +206,7 @@ func (pm *ParameterStore) PushSecret(ctx context.Context, value []byte, _ *apiex
 
 	// If we have a valid parameter returned to us, check its tags
 	if existing != nil && existing.Parameter != nil {
-		fmt.Println("The existing value contains data:", existing.String())
-		tags, err := pm.getTagsByName(ctx, existing)
-		if err != nil {
-			return fmt.Errorf("error getting the existing tags for the parameter %v: %w", secretName, err)
-		}
-
-		isManaged := isManagedByESO(tags)
-
-		if !isManaged {
-			return fmt.Errorf("secret not managed by external-secrets")
-		}
-
-		if existing.Parameter.Value != nil && *existing.Parameter.Value == string(value) {
-			return nil
-		}
-
-		return pm.setManagedRemoteParameter(ctx, secretRequest, false)
+		return pm.setExisting(ctx, existing, secretName, value, secretRequest)
 	}
 
 	// let's set the secret
@@ -183,13 +214,35 @@ func (pm *ParameterStore) PushSecret(ctx context.Context, value []byte, _ *apiex
 	return pm.setManagedRemoteParameter(ctx, secretRequest, true)
 }
 
-func isManagedByESO(tags []*ssm.Tag) bool {
-	for _, tag := range tags {
-		if *tag.Key == managedBy && *tag.Value == externalSecrets {
-			return true
-		}
+func (pm *ParameterStore) setExisting(ctx context.Context, existing *ssm.GetParameterOutput, secretName string, value []byte, secretRequest ssm.PutParameterInput) error {
+	tags, err := pm.getTagsByName(ctx, existing)
+	if err != nil {
+		return fmt.Errorf("error getting the existing tags for the parameter %v: %w", secretName, err)
 	}
-	return false
+
+	isManaged := isManagedByESO(tags)
+
+	if !isManaged {
+		return errors.New("secret not managed by external-secrets")
+	}
+
+	// When fetching a remote SecureString parameter without decrypting, the default value will always be 'sensitive'
+	// in this case, no updates will be pushed remotely
+	if existing.Parameter.Value != nil && *existing.Parameter.Value == "sensitive" {
+		return errors.New("unable to compare 'sensitive' result, ensure to request a decrypted value")
+	}
+
+	if existing.Parameter.Value != nil && *existing.Parameter.Value == string(value) {
+		return nil
+	}
+
+	return pm.setManagedRemoteParameter(ctx, secretRequest, false)
+}
+
+func isManagedByESO(tags []*ssm.Tag) bool {
+	return slices.ContainsFunc(tags, func(tag *ssm.Tag) bool {
+		return *tag.Key == managedBy && *tag.Value == externalSecrets
+	})
 }
 
 func (pm *ParameterStore) setManagedRemoteParameter(ctx context.Context, secretRequest ssm.PutParameterInput, createManagedByTags bool) error {
@@ -256,17 +309,17 @@ func (pm *ParameterStore) findByName(ctx context.Context, ref esv1beta1.External
 				logger.Info("GetParametersByPath: access denied. using fallback to describe parameters. It is recommended to add ssm:GetParametersByPath permissions", "path", ref.Path)
 				return pm.fallbackFindByName(ctx, ref)
 			}
+
 			return nil, err
 		}
+
 		for _, param := range it.Parameters {
 			if !matcher.MatchName(*param.Name) {
 				continue
 			}
-			err = pm.fetchAndSet(ctx, data, *param.Name)
-			if err != nil {
-				return nil, err
-			}
+			data[*param.Name] = []byte(*param.Value)
 		}
+
 		nextToken = it.NextToken
 		if nextToken == nil {
 			break
@@ -325,9 +378,9 @@ func (pm *ParameterStore) findByTags(ctx context.Context, ref esv1beta1.External
 	filters := make([]*ssm.ParameterStringFilter, 0)
 	for k, v := range ref.Tags {
 		filters = append(filters, &ssm.ParameterStringFilter{
-			Key:    utilpointer.To(fmt.Sprintf("tag:%s", k)),
-			Values: []*string{utilpointer.To(v)},
-			Option: utilpointer.To("Equals"),
+			Key:    ptr.To(fmt.Sprintf("tag:%s", k)),
+			Values: []*string{ptr.To(v)},
+			Option: ptr.To("Equals"),
 		})
 	}
 
@@ -369,7 +422,7 @@ func (pm *ParameterStore) findByTags(ctx context.Context, ref esv1beta1.External
 
 func (pm *ParameterStore) fetchAndSet(ctx context.Context, data map[string][]byte, name string) error {
 	out, err := pm.client.GetParameterWithContext(ctx, &ssm.GetParameterInput{
-		Name:           utilpointer.To(name),
+		Name:           ptr.To(name),
 		WithDecryption: aws.Bool(true),
 	})
 	metrics.ObserveAPICall(constants.ProviderAWSPS, constants.CallAWSPSGetParameter, err)
@@ -423,7 +476,7 @@ func (pm *ParameterStore) GetSecret(ctx context.Context, ref esv1beta1.ExternalS
 func (pm *ParameterStore) getParameterTags(ctx context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) (*ssm.GetParameterOutput, error) {
 	param := ssm.GetParameterOutput{
 		Parameter: &ssm.Parameter{
-			Name: parameterNameWithVersion(ref),
+			Name: pm.parameterNameWithVersion(ref),
 		},
 	}
 	tags, err := pm.getTagsByName(ctx, &param)
@@ -444,7 +497,7 @@ func (pm *ParameterStore) getParameterTags(ctx context.Context, ref esv1beta1.Ex
 
 func (pm *ParameterStore) getParameterValue(ctx context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) (*ssm.GetParameterOutput, error) {
 	out, err := pm.client.GetParameterWithContext(ctx, &ssm.GetParameterInput{
-		Name:           parameterNameWithVersion(ref),
+		Name:           pm.parameterNameWithVersion(ref),
 		WithDecryption: aws.Bool(true),
 	})
 
@@ -475,8 +528,8 @@ func (pm *ParameterStore) GetSecretMap(ctx context.Context, ref esv1beta1.Extern
 	return secretData, nil
 }
 
-func parameterNameWithVersion(ref esv1beta1.ExternalSecretDataRemoteRef) *string {
-	name := ref.Key
+func (pm *ParameterStore) parameterNameWithVersion(ref esv1beta1.ExternalSecretDataRemoteRef) *string {
+	name := pm.prefix + ref.Key
 	if ref.Version != "" {
 		// see docs: https://docs.aws.amazon.com/systems-manager/latest/userguide/sysman-paramstore-versions.html#reference-parameter-version
 		name += ":" + ref.Version

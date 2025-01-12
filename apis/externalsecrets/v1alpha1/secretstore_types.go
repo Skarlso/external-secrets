@@ -24,7 +24,7 @@ type SecretStoreSpec struct {
 	// Used to select the correct ESO controller (think: ingress.ingressClassName)
 	// The ESO controller is instantiated with a specific controller name and filters ES based on this property
 	// +optional
-	Controller string `json:"controller"`
+	Controller string `json:"controller,omitempty"`
 
 	// Used to configure the provider. Only one provider may be set
 	Provider *SecretStoreProvider `json:"provider"`
@@ -86,6 +86,8 @@ type SecretStoreProvider struct {
 	// +optional
 	Kubernetes *KubernetesProvider `json:"kubernetes,omitempty"`
 
+	PasswordDepot *PasswordDepotProvider `json:"passworddepot,omitempty"`
+
 	// Fake configures a store with static key/value pairs
 	// +optional
 	Fake *FakeProvider `json:"fake,omitempty"`
@@ -124,7 +126,7 @@ type SecretStoreStatusCondition struct {
 // SecretStoreStatus defines the observed state of the SecretStore.
 type SecretStoreStatus struct {
 	// +optional
-	Conditions []SecretStoreStatusCondition `json:"conditions"`
+	Conditions []SecretStoreStatusCondition `json:"conditions,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -134,7 +136,7 @@ type SecretStoreStatus struct {
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:subresource:status
 // +kubebuilder:deprecatedversion
-// +kubebuilder:resource:scope=Namespaced,categories={externalsecrets},shortName=ss
+// +kubebuilder:resource:scope=Namespaced,categories={external-secrets},shortName=ss
 type SecretStore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -159,7 +161,7 @@ type SecretStoreList struct {
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:deprecatedversion
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster,categories={externalsecrets},shortName=css
+// +kubebuilder:resource:scope=Cluster,categories={external-secrets},shortName=css
 type ClusterSecretStore struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

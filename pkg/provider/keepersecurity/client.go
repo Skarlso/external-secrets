@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package keepersecurity
 
 import (
@@ -18,12 +19,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"strings"
 
 	ksm "github.com/keeper-security/secrets-manager-go/core"
-	"golang.org/x/exp/maps"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 )
@@ -45,7 +46,7 @@ const (
 	errInvalidJSONSecret                        = "invalid Secret. Secret %s can not be converted to JSON. %w"
 	errInvalidRegex                             = "find.name.regex. Invalid Regular expresion %s. %w"
 	errInvalidRemoteRefKey                      = "match.remoteRef.remoteKey. Invalid format. Format should match secretName/key got %s"
-	errInvalidSecretType                        = "ESO can only push/delete %s record types. Secret %s is type %s"
+	errInvalidSecretType                        = "ESO can only push/delete records of type %s. Secret %s is type %s"
 	errFieldNotFound                            = "secret %s does not contain any custom field with label %s"
 
 	externalSecretType = "externalSecrets"
@@ -65,20 +66,21 @@ type Client struct {
 type SecurityClient interface {
 	GetSecrets(filter []string) ([]*ksm.Record, error)
 	GetSecretByTitle(recordTitle string) (*ksm.Record, error)
+	GetSecretsByTitle(recordTitle string) (records []*ksm.Record, err error)
 	CreateSecretWithRecordData(recUID, folderUID string, recordData *ksm.RecordCreate) (string, error)
 	DeleteSecrets(recrecordUids []string) (map[string]string, error)
 	Save(record *ksm.Record) error
 }
 
 type Field struct {
-	Type  string   `json:"type"`
-	Value []string `json:"value"`
+	Type  string `json:"type"`
+	Value []any  `json:"value"`
 }
 
 type CustomField struct {
-	Type  string   `json:"type"`
-	Label string   `json:"label"`
-	Value []string `json:"value"`
+	Type  string `json:"type"`
+	Label string `json:"label"`
+	Value []any  `json:"value"`
 }
 
 type File struct {
@@ -126,10 +128,10 @@ func (c *Client) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSecretDat
 
 func (c *Client) GetAllSecrets(_ context.Context, ref esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
 	if ref.Tags != nil {
-		return nil, fmt.Errorf(errTagsNotImplemented)
+		return nil, errors.New(errTagsNotImplemented)
 	}
 	if ref.Path != nil {
-		return nil, fmt.Errorf(errPathNotImplemented)
+		return nil, errors.New(errPathNotImplemented)
 	}
 	secretData := make(map[string][]byte)
 	records, err := c.findSecrets()
@@ -161,32 +163,35 @@ func (c *Client) Close(_ context.Context) error {
 	return nil
 }
 
-func (c *Client) PushSecret(_ context.Context, value []byte, _ *apiextensionsv1.JSON, remoteRef esv1beta1.PushRemoteRef) error {
-	parts, err := c.buildSecretNameAndKey(remoteRef)
+func (c *Client) PushSecret(_ context.Context, secret *corev1.Secret, data esv1beta1.PushSecretData) error {
+	if data.GetSecretKey() == "" {
+		return errors.New("pushing the whole secret is not yet implemented")
+	}
+
+	value := secret.Data[data.GetSecretKey()]
+	parts, err := c.buildSecretNameAndKey(data)
 	if err != nil {
 		return err
 	}
-	secret, err := c.findSecretByName(parts[0])
+
+	record, err := c.findSecretByName(parts[0])
 	if err != nil {
-		_, err = c.createSecret(parts[0], parts[1], value)
-		if err != nil {
-			return err
-		}
-	}
-	if secret != nil {
-		if secret.Type() != externalSecretType {
-			return fmt.Errorf(errInvalidSecretType, externalSecretType, secret.Title(), secret.Type())
-		}
-		err = c.updateSecret(secret, parts[1], value)
-		if err != nil {
-			return err
-		}
+		return err
 	}
 
-	return nil
+	if record != nil {
+		if record.Type() == externalSecretType {
+			return c.updateSecret(record, parts[1], value)
+		} else {
+			return fmt.Errorf(errInvalidSecretType, externalSecretType, record.Title(), record.Type())
+		}
+	} else {
+		_, err = c.createSecret(parts[0], parts[1], value)
+		return err
+	}
 }
 
-func (c *Client) DeleteSecret(_ context.Context, remoteRef esv1beta1.PushRemoteRef) error {
+func (c *Client) DeleteSecret(_ context.Context, remoteRef esv1beta1.PushSecretRemoteRef) error {
 	parts, err := c.buildSecretNameAndKey(remoteRef)
 	if err != nil {
 		return err
@@ -194,19 +199,22 @@ func (c *Client) DeleteSecret(_ context.Context, remoteRef esv1beta1.PushRemoteR
 	secret, err := c.findSecretByName(parts[0])
 	if err != nil {
 		return err
+	} else if secret == nil {
+		return nil // not found == already deleted (success)
 	}
+
 	if secret.Type() != externalSecretType {
 		return fmt.Errorf(errInvalidSecretType, externalSecretType, secret.Title(), secret.Type())
 	}
 	_, err = c.ksmClient.DeleteSecrets([]string{secret.Uid})
-	if err != nil {
-		return nil
-	}
-
-	return nil
+	return err
 }
 
-func (c *Client) buildSecretNameAndKey(remoteRef esv1beta1.PushRemoteRef) ([]string, error) {
+func (c *Client) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New("not implemented")
+}
+
+func (c *Client) buildSecretNameAndKey(remoteRef esv1beta1.PushSecretRemoteRef) ([]string, error) {
 	parts := strings.Split(remoteRef.GetRemoteKey(), "/")
 	if len(parts) != 2 {
 		return nil, fmt.Errorf(errInvalidRemoteRefKey, remoteRef.GetRemoteKey())
@@ -315,12 +323,32 @@ func (c *Client) findSecretByID(id string) (*ksm.Record, error) {
 }
 
 func (c *Client) findSecretByName(name string) (*ksm.Record, error) {
-	record, err := c.ksmClient.GetSecretByTitle(name)
+	records, err := c.ksmClient.GetSecretsByTitle(name)
 	if err != nil {
 		return nil, err
 	}
 
-	return record, nil
+	// filter in-place, preserve only records of type externalSecretType
+	n := 0
+	for _, record := range records {
+		if record.Type() == externalSecretType {
+			records[n] = record
+			n++
+		}
+	}
+	records = records[:n]
+
+	// record not found is not an error - handled differently:
+	// PushSecret will create new record instead
+	// DeleteSecret will consider record already deleted (no error)
+	if len(records) == 0 {
+		return nil, nil
+	} else if len(records) == 1 {
+		return records[0], nil
+	}
+
+	// len(records) > 1
+	return nil, fmt.Errorf(errKeeperSecuritySecretNotUnique, name)
 }
 
 func (s *Secret) validate() error {
@@ -396,10 +424,25 @@ func (s *Secret) getItems(ref esv1beta1.ExternalSecretDataRemoteRef) (map[string
 	return secretData, nil
 }
 
+func getFieldValue(value []any) []byte {
+	if len(value) < 1 {
+		return []byte{}
+	} else if len(value) == 1 {
+		res, _ := json.Marshal(value[0])
+		if str, ok := value[0].(string); ok {
+			res = []byte(str)
+		}
+		return res
+	} else {
+		res, _ := json.Marshal(value)
+		return res
+	}
+}
+
 func (s *Secret) getField(key string) ([]byte, error) {
 	for _, field := range s.Fields {
 		if field.Type == key && field.Type != keeperSecurityFileRef && field.Type != keeperSecurityMfa && len(field.Value) > 0 {
-			return []byte(field.Value[0]), nil
+			return getFieldValue(field.Value), nil
 		}
 	}
 
@@ -410,7 +453,7 @@ func (s *Secret) getFields() map[string][]byte {
 	secretData := make(map[string][]byte)
 	for _, field := range s.Fields {
 		if len(field.Value) > 0 {
-			secretData[field.Type] = []byte(field.Value[0])
+			secretData[field.Type] = getFieldValue(field.Value)
 		}
 	}
 
@@ -420,7 +463,7 @@ func (s *Secret) getFields() map[string][]byte {
 func (s *Secret) getCustomField(key string) ([]byte, error) {
 	for _, field := range s.Custom {
 		if field.Label == key && len(field.Value) > 0 {
-			return []byte(field.Value[0]), nil
+			return getFieldValue(field.Value), nil
 		}
 	}
 
@@ -431,7 +474,7 @@ func (s *Secret) getCustomFields() map[string][]byte {
 	secretData := make(map[string][]byte)
 	for _, field := range s.Custom {
 		if len(field.Value) > 0 {
-			secretData[field.Label] = []byte(field.Value[0])
+			secretData[field.Label] = getFieldValue(field.Value)
 		}
 	}
 

@@ -11,12 +11,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package fake
 
 import (
 	"context"
 
-	"github.com/Azure/azure-sdk-for-go/profiles/latest/keyvault/keyvault"
+	"github.com/Azure/azure-sdk-for-go/services/keyvault/v7.0/keyvault"
 )
 
 type AzureMockClient struct {

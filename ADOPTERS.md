@@ -3,12 +3,17 @@
 <!-- Add yourself here if you are using ESO in your company or your project! -->
 
 - [Amadeus](https://amadeus.com/)
+- [Codefresh](https://codefresh.io/)
 - [Container Solutions](http://container-solutions.com/)
 - [DaangnPay](https://www.daangnpay.com/)
 - [Epidemic Sound](https://www.epidemicsound.com/)
+- [Elastic](https://www.elastic.co/)
+- [Fivetran](https://www.fivetran.com)
 - [Form3](https://www.form3.tech/)
 - [GoTo](https://www.goto.com/)
+- [Grafana Labs](https://grafana.com/)
 - [Heureka Group](https://heureka.group)
+- [Hostinger](https://www.hostinger.com/)
 - [K8S Website Infra](https://k8s.io/)
 - [Mercedes-Benz Tech Innovation](https://www.mercedes-benz-techinnovation.com/)
 - [Mixpanel](https://mixpanel.com)

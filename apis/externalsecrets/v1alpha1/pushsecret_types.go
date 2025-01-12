@@ -18,6 +18,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 )
 
 const (
@@ -28,17 +30,31 @@ const (
 type PushSecretStoreRef struct {
 	// Optionally, sync to the SecretStore of the given name
 	// +optional
-	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength:=1
+	// +kubebuilder:validation:MaxLength:=253
+	// +kubebuilder:validation:Pattern:=^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+	Name string `json:"name,omitempty"`
+
 	// Optionally, sync to secret stores with label selector
 	// +optional
-	LabelSelector *metav1.LabelSelector `json:"labelSelector"`
+	LabelSelector *metav1.LabelSelector `json:"labelSelector,omitempty"`
+
 	// Kind of the SecretStore resource (SecretStore or ClusterSecretStore)
-	// Defaults to `SecretStore`
-	// +kubebuilder:default="SecretStore"
 	// +optional
+	// +kubebuilder:default="SecretStore"
+	// +kubebuilder:validation:Enum=SecretStore;ClusterSecretStore
 	Kind string `json:"kind,omitempty"`
 }
 
+// +kubebuilder:validation:Enum=Replace;IfNotExists
+type PushSecretUpdatePolicy string
+
+const (
+	PushSecretUpdatePolicyReplace     PushSecretUpdatePolicy = "Replace"
+	PushSecretUpdatePolicyIfNotExists PushSecretUpdatePolicy = "IfNotExists"
+)
+
+// +kubebuilder:validation:Enum=Delete;None
 type PushSecretDeletionPolicy string
 
 const (
@@ -46,29 +62,61 @@ const (
 	PushSecretDeletionPolicyNone   PushSecretDeletionPolicy = "None"
 )
 
+// +kubebuilder:validation:Enum=None;ReverseUnicode
+type PushSecretConversionStrategy string
+
+const (
+	PushSecretConversionNone           PushSecretConversionStrategy = "None"
+	PushSecretConversionReverseUnicode PushSecretConversionStrategy = "ReverseUnicode"
+)
+
 // PushSecretSpec configures the behavior of the PushSecret.
 type PushSecretSpec struct {
 	// The Interval to which External Secrets will try to push a secret definition
-	RefreshInterval *metav1.Duration     `json:"refreshInterval,omitempty"`
+	RefreshInterval *metav1.Duration `json:"refreshInterval,omitempty"`
+
 	SecretStoreRefs []PushSecretStoreRef `json:"secretStoreRefs"`
-	// Deletion Policy to handle Secrets in the provider. Possible Values: "Delete/None". Defaults to "None".
+
+	// UpdatePolicy to handle Secrets in the provider.
+	// +kubebuilder:default="Replace"
+	// +optional
+	UpdatePolicy PushSecretUpdatePolicy `json:"updatePolicy,omitempty"`
+
+	// Deletion Policy to handle Secrets in the provider.
 	// +kubebuilder:default="None"
 	// +optional
 	DeletionPolicy PushSecretDeletionPolicy `json:"deletionPolicy,omitempty"`
+
 	// The Secret Selector (k8s source) for the Push Secret
 	Selector PushSecretSelector `json:"selector"`
+
 	// Secret Data that should be pushed to providers
 	Data []PushSecretData `json:"data,omitempty"`
+
+	// Template defines a blueprint for the created Secret resource.
+	// +optional
+	Template *esv1beta1.ExternalSecretTemplate `json:"template,omitempty"`
 }
 
 type PushSecretSecret struct {
-	// Name of the Secret. The Secret must exist in the same namespace as the PushSecret manifest.
+	// Name of the Secret.
+	// The Secret must exist in the same namespace as the PushSecret manifest.
+	// +kubebuilder:validation:MinLength:=1
+	// +kubebuilder:validation:MaxLength:=253
+	// +kubebuilder:validation:Pattern:=^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
 	Name string `json:"name"`
 }
 
+// +kubebuilder:validation:MinProperties=1
+// +kubebuilder:validation:MaxProperties=1
 type PushSecretSelector struct {
 	// Select a Secret to Push.
-	Secret PushSecretSecret `json:"secret"`
+	// +optional
+	Secret *PushSecretSecret `json:"secret,omitempty"`
+
+	// Point to a generator to create a Secret.
+	// +optional
+	GeneratorRef *esv1beta1.GeneratorRef `json:"generatorRef,omitempty"`
 }
 
 type PushSecretRemoteRef struct {
@@ -90,7 +138,8 @@ func (r PushSecretRemoteRef) GetProperty() string {
 
 type PushSecretMatch struct {
 	// Secret Key to be pushed
-	SecretKey string `json:"secretKey"`
+	// +optional
+	SecretKey string `json:"secretKey,omitempty"`
 	// Remote Refs to push to providers.
 	RemoteRef PushSecretRemoteRef `json:"remoteRef"`
 }
@@ -102,6 +151,26 @@ type PushSecretData struct {
 	// The structure of metadata is provider specific, please look it up in the provider documentation.
 	// +optional
 	Metadata *apiextensionsv1.JSON `json:"metadata,omitempty"`
+	// +optional
+	// Used to define a conversion Strategy for the secret keys
+	// +kubebuilder:default="None"
+	ConversionStrategy PushSecretConversionStrategy `json:"conversionStrategy,omitempty"`
+}
+
+func (d PushSecretData) GetMetadata() *apiextensionsv1.JSON {
+	return d.Metadata
+}
+
+func (d PushSecretData) GetSecretKey() string {
+	return d.Match.SecretKey
+}
+
+func (d PushSecretData) GetRemoteKey() string {
+	return d.Match.RemoteRef.RemoteKey
+}
+
+func (d PushSecretData) GetProperty() string {
+	return d.Match.RemoteRef.Property
 }
 
 // PushSecretConditionType indicates the condition of the PushSecret.
@@ -125,6 +194,7 @@ type PushSecretStatusCondition struct {
 	// +optional
 	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
 }
+
 type SyncedPushSecretsMap map[string]map[string]PushSecretData
 
 // PushSecretStatus indicates the history of the status of PushSecret.
@@ -136,7 +206,8 @@ type PushSecretStatus struct {
 
 	// SyncedResourceVersion keeps track of the last synced version.
 	SyncedResourceVersion string `json:"syncedResourceVersion,omitempty"`
-	// Synced Push Secrets for later deletion. Matches Secret Stores to PushSecretData that was stored to that secretStore.
+	// Synced PushSecrets, including secrets that already exist in provider.
+	// Matches secret stores to PushSecretData that was stored to that secret store.
 	// +optional
 	SyncedPushSecrets SyncedPushSecretsMap `json:"syncedPushSecrets,omitempty"`
 	// +optional
@@ -149,7 +220,8 @@ type PushSecretStatus struct {
 // +kubebuilder:printcolumn:name="AGE",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:printcolumn:name="Status",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced,categories={pushsecrets}
+// +kubebuilder:metadata:labels="external-secrets.io/component=controller"
+// +kubebuilder:resource:scope=Namespaced,categories={external-secrets}
 
 type PushSecret struct {
 	metav1.TypeMeta   `json:",inline"`

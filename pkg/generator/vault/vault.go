@@ -17,6 +17,7 @@ package vaultdynamic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	vault "github.com/hashicorp/vault/api"
@@ -29,6 +30,8 @@ import (
 
 	genv1alpha1 "github.com/external-secrets/external-secrets/apis/generators/v1alpha1"
 	provider "github.com/external-secrets/external-secrets/pkg/provider/vault"
+	"github.com/external-secrets/external-secrets/pkg/provider/vault/util"
+	"github.com/external-secrets/external-secrets/pkg/utils"
 )
 
 type Generator struct{}
@@ -41,7 +44,7 @@ const (
 )
 
 func (g *Generator) Generate(ctx context.Context, jsonSpec *apiextensions.JSON, kube client.Client, namespace string) (map[string][]byte, error) {
-	c := &provider.Connector{NewVaultClient: provider.NewVaultClient}
+	c := &provider.Provider{NewVaultClient: provider.NewVaultClient}
 
 	// controller-runtime/client does not support TokenRequest or other subresource APIs
 	// so we need to construct our own client and use it to fetch tokens
@@ -58,47 +61,36 @@ func (g *Generator) Generate(ctx context.Context, jsonSpec *apiextensions.JSON, 
 	return g.generate(ctx, c, jsonSpec, kube, clientset.CoreV1(), namespace)
 }
 
-func (g *Generator) generate(ctx context.Context, c *provider.Connector, jsonSpec *apiextensions.JSON, kube client.Client, corev1 typedcorev1.CoreV1Interface, namespace string) (map[string][]byte, error) {
+func (g *Generator) generate(ctx context.Context, c *provider.Provider, jsonSpec *apiextensions.JSON, kube client.Client, corev1 typedcorev1.CoreV1Interface, namespace string) (map[string][]byte, error) {
 	if jsonSpec == nil {
-		return nil, fmt.Errorf(errNoSpec)
+		return nil, errors.New(errNoSpec)
 	}
 	res, err := parseSpec(jsonSpec.Raw)
 	if err != nil {
 		return nil, fmt.Errorf(errParseSpec, err)
 	}
 	if res == nil || res.Spec.Provider == nil {
-		return nil, fmt.Errorf("no Vault provider config in spec")
+		return nil, errors.New("no Vault provider config in spec")
 	}
-	cl, err := c.NewGeneratorClient(ctx, kube, corev1, res.Spec.Provider, namespace)
+	cl, err := c.NewGeneratorClient(ctx, kube, corev1, res.Spec.Provider, namespace, res.Spec.RetrySettings)
 	if err != nil {
 		return nil, fmt.Errorf(errVaultClient, err)
 	}
 
-	var result *vault.Secret
-	if res.Spec.Method == "" || res.Spec.Method == "GET" {
-		result, err = cl.Logical().ReadWithDataWithContext(ctx, res.Spec.Path, nil)
-	} else if res.Spec.Method == "LIST" {
-		result, err = cl.Logical().ListWithContext(ctx, res.Spec.Path)
-	} else if res.Spec.Method == "DELETE" {
-		result, err = cl.Logical().DeleteWithContext(ctx, res.Spec.Path)
-	} else {
-		params := make(map[string]interface{})
-		if res.Spec.Parameters != nil {
-			err = json.Unmarshal(res.Spec.Parameters.Raw, &params)
-			if err != nil {
-				return nil, err
-			}
-		}
-		result, err = cl.Logical().WriteWithContext(ctx, res.Spec.Path, params)
-	}
+	result, err := g.fetchVaultSecret(ctx, res, cl)
 	if err != nil {
 		return nil, err
 	}
-	if result == nil {
-		return nil, fmt.Errorf(errGetSecret, fmt.Errorf("empty response from Vault"))
+
+	if result == nil && res.Spec.AllowEmptyResponse {
+		return nil, nil
 	}
 
-	data := make(map[string]interface{})
+	if result == nil {
+		return nil, fmt.Errorf(errGetSecret, errors.New("empty response from Vault"))
+	}
+
+	data := make(map[string]any)
 	response := make(map[string][]byte)
 	if res.Spec.ResultType == genv1alpha1.VaultDynamicSecretResultTypeAuth {
 		authJSON, err := json.Marshal(result.Auth)
@@ -114,12 +106,38 @@ func (g *Generator) generate(ctx context.Context, c *provider.Connector, jsonSpe
 	}
 
 	for k := range data {
-		response[k], err = provider.GetTypedKey(data, k)
+		response[k], err = utils.GetByteValueFromMap(data, k)
 		if err != nil {
 			return nil, err
 		}
 	}
 	return response, nil
+}
+
+func (g *Generator) fetchVaultSecret(ctx context.Context, res *genv1alpha1.VaultDynamicSecret, cl util.Client) (*vault.Secret, error) {
+	var (
+		result *vault.Secret
+		err    error
+	)
+
+	if res.Spec.Method == "" || res.Spec.Method == "GET" {
+		result, err = cl.Logical().ReadWithDataWithContext(ctx, res.Spec.Path, nil)
+	} else if res.Spec.Method == "LIST" {
+		result, err = cl.Logical().ListWithContext(ctx, res.Spec.Path)
+	} else if res.Spec.Method == "DELETE" {
+		result, err = cl.Logical().DeleteWithContext(ctx, res.Spec.Path)
+	} else {
+		params := make(map[string]any)
+		if res.Spec.Parameters != nil {
+			if err := json.Unmarshal(res.Spec.Parameters.Raw, &params); err != nil {
+				return nil, err
+			}
+		}
+
+		result, err = cl.Logical().WriteWithContext(ctx, res.Spec.Path, params)
+	}
+
+	return result, err
 }
 
 func parseSpec(data []byte) (*genv1alpha1.VaultDynamicSecret, error) {

@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package template
 
 import (
@@ -31,7 +32,13 @@ var tplFuncs = tpl.FuncMap{
 	"pkcs12cert":     pkcs12cert,
 	"pkcs12certPass": pkcs12certPass,
 
-	"filterPEM": filterPEM,
+	"pemToPkcs12":         pemToPkcs12,
+	"pemToPkcs12Pass":     pemToPkcs12Pass,
+	"fullPemToPkcs12":     fullPemToPkcs12,
+	"fullPemToPkcs12Pass": fullPemToPkcs12Pass,
+
+	"filterPEM":       filterPEM,
+	"filterCertChain": filterCertChain,
 
 	"jwkPublicKeyPem":  jwkPublicKeyPem,
 	"jwkPrivateKeyPem": jwkPrivateKeyPem,
@@ -53,6 +60,7 @@ const (
 	errParsePrivKey         = "unable to parse private key type"
 
 	pemTypeCertificate = "CERTIFICATE"
+	pemTypeKey         = "PRIVATE KEY"
 )
 
 func init() {
@@ -68,10 +76,19 @@ func init() {
 func applyToTarget(k, val string, target esapi.TemplateTarget, secret *corev1.Secret) {
 	switch target {
 	case esapi.TemplateTargetAnnotations:
+		if secret.Annotations == nil {
+			secret.Annotations = make(map[string]string)
+		}
 		secret.Annotations[k] = val
 	case esapi.TemplateTargetLabels:
+		if secret.Labels == nil {
+			secret.Labels = make(map[string]string)
+		}
 		secret.Labels[k] = val
 	case esapi.TemplateTargetData:
+		if secret.Data == nil {
+			secret.Data = make(map[string][]byte)
+		}
 		secret.Data[k] = []byte(val)
 	default:
 	}
@@ -135,6 +152,7 @@ func execute(k, val string, data map[string][]byte) ([]byte, error) {
 	}
 
 	t, err := tpl.New(k).
+		Option("missingkey=error").
 		Funcs(tplFuncs).
 		Parse(val)
 	if err != nil {

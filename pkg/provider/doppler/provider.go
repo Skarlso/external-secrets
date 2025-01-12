@@ -16,11 +16,13 @@ package doppler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	dClient "github.com/external-secrets/external-secrets/pkg/provider/doppler/client"
@@ -54,7 +56,7 @@ func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, 
 	storeSpec := store.GetSpec()
 
 	if storeSpec == nil || storeSpec.Provider == nil || storeSpec.Provider.Doppler == nil {
-		return nil, fmt.Errorf(errDopplerStore)
+		return nil, errors.New(errDopplerStore)
 	}
 
 	dopplerStoreSpec := storeSpec.Provider.Doppler
@@ -102,17 +104,17 @@ func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, 
 	return client, nil
 }
 
-func (p *Provider) ValidateStore(store esv1beta1.GenericStore) error {
+func (p *Provider) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
 	storeSpec := store.GetSpec()
 	dopplerStoreSpec := storeSpec.Provider.Doppler
 	dopplerTokenSecretRef := dopplerStoreSpec.Auth.SecretRef.DopplerToken
 	if err := utils.ValidateSecretSelector(store, dopplerTokenSecretRef); err != nil {
-		return fmt.Errorf(errInvalidStore, err)
+		return nil, fmt.Errorf(errInvalidStore, err)
 	}
 
 	if dopplerTokenSecretRef.Name == "" {
-		return fmt.Errorf(errInvalidStore, "dopplerToken.name cannot be empty")
+		return nil, fmt.Errorf(errInvalidStore, "dopplerToken.name cannot be empty")
 	}
 
-	return nil
+	return nil, nil
 }

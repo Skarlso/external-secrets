@@ -11,14 +11,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package ibm
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -27,43 +28,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/types"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	"github.com/external-secrets/external-secrets/pkg/constants"
 	"github.com/external-secrets/external-secrets/pkg/metrics"
 	"github.com/external-secrets/external-secrets/pkg/utils"
+	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 )
 
 const (
-	SecretsManagerEndpointEnv = "IBM_SECRETSMANAGER_ENDPOINT"
-	STSEndpointEnv            = "IBM_STS_ENDPOINT"
-	SSMEndpointEnv            = "IBM_SSM_ENDPOINT"
-
 	certificateConst  = "certificate"
 	intermediateConst = "intermediate"
 	privateKeyConst   = "private_key"
 	usernameConst     = "username"
 	passwordConst     = "password"
 	apikeyConst       = "apikey"
+	credentialsConst  = "credentials"
 	arbitraryConst    = "arbitrary"
 	payloadConst      = "payload"
 	smAPIKeyConst     = "api_key"
 
-	errIBMClient                             = "cannot setup new ibm client: %w"
-	errIBMCredSecretName                     = "invalid IBM SecretStore resource: missing IBM APIKey"
-	errUninitalizedIBMProvider               = "provider IBM is not initialized"
-	errInvalidClusterStoreMissingSKNamespace = "invalid ClusterStore, missing namespace"
-	errFetchSAKSecret                        = "could not fetch SecretAccessKey secret: %w"
-	errMissingSAK                            = "missing SecretAccessKey"
-	errJSONSecretUnmarshal                   = "unable to unmarshal secret: %w"
-	errJSONSecretMarshal                     = "unable to marshal secret: %w"
-	errExtractingSecret                      = "unable to extract the fetched secret %s of type %s while performing %s"
-
-	defaultCacheSize   = 100
-	defaultCacheExpiry = 1 * time.Hour
+	errIBMClient                = "cannot setup new ibm client: %w"
+	errUninitializedIBMProvider = "provider IBM is not initialized"
+	errJSONSecretUnmarshal      = "unable to unmarshal secret: %w"
+	errJSONSecretMarshal        = "unable to marshal secret: %w"
+	errExtractingSecret         = "unable to extract the fetched secret %s of type %s while performing %s"
+	errNotImplemented           = "not implemented"
+	errKeyDoesNotExist          = "key %s does not exist in secret %s"
 )
 
 var contextTimeout = time.Minute * 2
@@ -76,13 +69,11 @@ var (
 
 type SecretManagerClient interface {
 	GetSecretWithContext(ctx context.Context, getSecretOptions *sm.GetSecretOptions) (result sm.SecretIntf, response *core.DetailedResponse, err error)
-	ListSecretsWithContext(ctx context.Context, listSecretsOptions *sm.ListSecretsOptions) (result *sm.SecretMetadataPaginatedCollection, response *core.DetailedResponse, err error)
 	GetSecretByNameTypeWithContext(ctx context.Context, getSecretByNameTypeOptions *sm.GetSecretByNameTypeOptions) (result sm.SecretIntf, response *core.DetailedResponse, err error)
 }
 
 type providerIBM struct {
 	IBMClient SecretManagerClient
-	cache     cacheIntf
 }
 
 type client struct {
@@ -94,54 +85,36 @@ type client struct {
 }
 
 func (c *client) setAuth(ctx context.Context) error {
-	credentialsSecret := &corev1.Secret{}
-	credentialsSecretName := c.store.Auth.SecretRef.SecretAPIKey.Name
-	if credentialsSecretName == "" {
-		return fmt.Errorf(errIBMCredSecretName)
-	}
-	objectKey := types.NamespacedName{
-		Name:      credentialsSecretName,
-		Namespace: c.namespace,
-	}
-
-	// only ClusterStore is allowed to set namespace (and then it's required)
-	if c.storeKind == esv1beta1.ClusterSecretStoreKind {
-		if c.store.Auth.SecretRef.SecretAPIKey.Namespace == nil {
-			return fmt.Errorf(errInvalidClusterStoreMissingSKNamespace)
-		}
-		objectKey.Namespace = *c.store.Auth.SecretRef.SecretAPIKey.Namespace
-	}
-
-	err := c.kube.Get(ctx, objectKey, credentialsSecret)
+	apiKey, err := resolvers.SecretKeyRef(ctx, c.kube, c.storeKind, c.namespace, &c.store.Auth.SecretRef.SecretAPIKey)
 	if err != nil {
-		return fmt.Errorf(errFetchSAKSecret, err)
+		return err
 	}
-
-	c.credentials = credentialsSecret.Data[c.store.Auth.SecretRef.SecretAPIKey.Key]
-	if (c.credentials == nil) || (len(c.credentials) == 0) {
-		return fmt.Errorf(errMissingSAK)
-	}
+	c.credentials = []byte(apiKey)
 	return nil
 }
 
-func (ibm *providerIBM) DeleteSecret(_ context.Context, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (ibm *providerIBM) DeleteSecret(_ context.Context, _ esv1beta1.PushSecretRemoteRef) error {
+	return errors.New(errNotImplemented)
 }
 
-// Not Implemented PushSecret.
-func (ibm *providerIBM) PushSecret(_ context.Context, _ []byte, _ *apiextensionsv1.JSON, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (ibm *providerIBM) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New(errNotImplemented)
 }
 
-// Empty GetAllSecrets.
+// PushSecret not implemented.
+func (ibm *providerIBM) PushSecret(_ context.Context, _ *corev1.Secret, _ esv1beta1.PushSecretData) error {
+	return errors.New(errNotImplemented)
+}
+
+// GetAllSecrets empty.
 func (ibm *providerIBM) GetAllSecrets(_ context.Context, _ esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
 	// TO be implemented
-	return nil, fmt.Errorf("GetAllSecrets not implemented")
+	return nil, errors.New(errNotImplemented)
 }
 
 func (ibm *providerIBM) GetSecret(_ context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error) {
 	if utils.IsNil(ibm.IBMClient) {
-		return nil, fmt.Errorf(errUninitalizedIBMProvider)
+		return nil, errors.New(errUninitializedIBMProvider)
 	}
 
 	var secretGroupName string
@@ -166,7 +139,7 @@ func (ibm *providerIBM) GetSecret(_ context.Context, ref esv1beta1.ExternalSecre
 	case sm.Secret_SecretType_UsernamePassword:
 
 		if ref.Property == "" {
-			return nil, fmt.Errorf("remoteRef.property required for secret type username_password")
+			return nil, errors.New("remoteRef.property required for secret type username_password")
 		}
 		return getUsernamePasswordSecret(ibm, &secretName, ref, secretGroupName)
 
@@ -174,10 +147,14 @@ func (ibm *providerIBM) GetSecret(_ context.Context, ref esv1beta1.ExternalSecre
 
 		return getIamCredentialsSecret(ibm, &secretName, secretGroupName)
 
+	case sm.Secret_SecretType_ServiceCredentials:
+
+		return getServiceCredentialsSecret(ibm, &secretName, secretGroupName)
+
 	case sm.Secret_SecretType_ImportedCert:
 
 		if ref.Property == "" {
-			return nil, fmt.Errorf("remoteRef.property required for secret type imported_cert")
+			return nil, errors.New("remoteRef.property required for secret type imported_cert")
 		}
 
 		return getImportCertSecret(ibm, &secretName, ref, secretGroupName)
@@ -185,7 +162,7 @@ func (ibm *providerIBM) GetSecret(_ context.Context, ref esv1beta1.ExternalSecre
 	case sm.Secret_SecretType_PublicCert:
 
 		if ref.Property == "" {
-			return nil, fmt.Errorf("remoteRef.property required for secret type public_cert")
+			return nil, errors.New("remoteRef.property required for secret type public_cert")
 		}
 
 		return getPublicCertSecret(ibm, &secretName, ref, secretGroupName)
@@ -193,7 +170,7 @@ func (ibm *providerIBM) GetSecret(_ context.Context, ref esv1beta1.ExternalSecre
 	case sm.Secret_SecretType_PrivateCert:
 
 		if ref.Property == "" {
-			return nil, fmt.Errorf("remoteRef.property required for secret type private_cert")
+			return nil, errors.New("remoteRef.property required for secret type private_cert")
 		}
 
 		return getPrivateCertSecret(ibm, &secretName, ref, secretGroupName)
@@ -227,7 +204,7 @@ func getArbitrarySecret(ibm *providerIBM, secretName *string, secretGroupName st
 	if val, ok := secMap[payloadConst]; ok {
 		return []byte(val.(string)), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", payloadConst, *secretName)
+	return nil, fmt.Errorf(errKeyDoesNotExist, payloadConst, *secretName)
 }
 
 func getImportCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.ExternalSecretDataRemoteRef, secretGroupName string) ([]byte, error) {
@@ -248,7 +225,7 @@ func getImportCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.Ext
 		fmt.Printf("warn: %s is empty for secret %s\n", privateKeyConst, *secretName)
 		return []byte(""), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", ref.Property, ref.Key)
+	return nil, fmt.Errorf(errKeyDoesNotExist, ref.Property, ref.Key)
 }
 
 func getPublicCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.ExternalSecretDataRemoteRef, secretGroupName string) ([]byte, error) {
@@ -263,7 +240,7 @@ func getPublicCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.Ext
 	if val, ok := secMap[ref.Property]; ok {
 		return []byte(val.(string)), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", ref.Property, ref.Key)
+	return nil, fmt.Errorf(errKeyDoesNotExist, ref.Property, ref.Key)
 }
 
 func getPrivateCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.ExternalSecretDataRemoteRef, secretGroupName string) ([]byte, error) {
@@ -278,7 +255,7 @@ func getPrivateCertSecret(ibm *providerIBM, secretName *string, ref esv1beta1.Ex
 	if val, ok := secMap[ref.Property]; ok {
 		return []byte(val.(string)), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", ref.Property, ref.Key)
+	return nil, fmt.Errorf(errKeyDoesNotExist, ref.Property, ref.Key)
 }
 
 func getIamCredentialsSecret(ibm *providerIBM, secretName *string, secretGroupName string) ([]byte, error) {
@@ -293,7 +270,26 @@ func getIamCredentialsSecret(ibm *providerIBM, secretName *string, secretGroupNa
 	if val, ok := secMap[smAPIKeyConst]; ok {
 		return []byte(val.(string)), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", smAPIKeyConst, *secretName)
+	return nil, fmt.Errorf(errKeyDoesNotExist, smAPIKeyConst, *secretName)
+}
+
+func getServiceCredentialsSecret(ibm *providerIBM, secretName *string, secretGroupName string) ([]byte, error) {
+	response, err := getSecretData(ibm, secretName, sm.Secret_SecretType_ServiceCredentials, secretGroupName)
+	if err != nil {
+		return nil, err
+	}
+	secMap, err := formSecretMap(response)
+	if err != nil {
+		return nil, err
+	}
+	if val, ok := secMap[credentialsConst]; ok {
+		mval, err := json.Marshal(val)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal secret map for service credentials secret: %w", err)
+		}
+		return mval, nil
+	}
+	return nil, fmt.Errorf(errKeyDoesNotExist, credentialsConst, *secretName)
 }
 
 func getUsernamePasswordSecret(ibm *providerIBM, secretName *string, ref esv1beta1.ExternalSecretDataRemoteRef, secretGroupName string) ([]byte, error) {
@@ -308,7 +304,7 @@ func getUsernamePasswordSecret(ibm *providerIBM, secretName *string, ref esv1bet
 	if val, ok := secMap[ref.Property]; ok {
 		return []byte(val.(string)), nil
 	}
-	return nil, fmt.Errorf("key %s does not exist in secret %s", ref.Property, ref.Key)
+	return nil, fmt.Errorf(errKeyDoesNotExist, ref.Property, ref.Key)
 }
 
 // Returns a secret of type kv and supports json path.
@@ -347,7 +343,7 @@ func getKVSecret(ref esv1beta1.ExternalSecretDataRemoteRef, secret *sm.KVSecret)
 		// try to get value for this path
 		val := gjson.Get(payloadJSON, ref.Property)
 		if !val.Exists() {
-			return nil, fmt.Errorf("key %s does not exist in secret %s", ref.Property, ref.Key)
+			return nil, fmt.Errorf(errKeyDoesNotExist, ref.Property, ref.Key)
 		}
 		return []byte(val.String()), nil
 	}
@@ -356,46 +352,30 @@ func getKVSecret(ref esv1beta1.ExternalSecretDataRemoteRef, secret *sm.KVSecret)
 }
 
 func getSecretData(ibm *providerIBM, secretName *string, secretType, secretGroupName string) (sm.SecretIntf, error) {
-	var givenName *string
-	var cachedKey string
-
 	_, err := uuid.Parse(*secretName)
 	if err != nil {
 		// secret name has been provided instead of id
 		if secretGroupName == "" {
-			// secret group name is not provided, follow the existing mechanism
-			// once this mechanism is deprecated, this flow will not be supported, and error will be thrown instead
-			givenName = secretName
-			cachedKey = fmt.Sprintf("%s/%s", secretType, *givenName)
-			isCached, cacheData := ibm.cache.GetData(cachedKey)
-			tmp := string(cacheData)
-			cachedName := &tmp
-			if isCached && *cachedName != "" {
-				secretName = cachedName
-			} else {
-				secretName, err = findSecretByName(ibm, givenName, secretType)
-				if err != nil {
-					return nil, err
-				}
-				ibm.cache.PutData(cachedKey, []byte(*secretName))
-			}
-		} else {
-			// secret group name is provided along with secret name, follow the new mechanism by calling GetSecretByNameTypeWithContext
-			ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
-			defer cancel()
-			response, _, err := ibm.IBMClient.GetSecretByNameTypeWithContext(
-				ctx,
-				&sm.GetSecretByNameTypeOptions{
-					Name:            secretName,
-					SecretGroupName: &secretGroupName,
-					SecretType:      &secretType,
-				})
-			metrics.ObserveAPICall(constants.ProviderIBMSM, constants.CallIBMSMGetSecretByNameType, err)
-			if err != nil {
-				return nil, err
-			}
-			return response, nil
+			// secret group name is not provided
+			return nil, errors.New("failed to fetch the secret, secret group name is missing")
 		}
+
+		// secret group name is provided along with secret name,
+		// follow the new mechanism by calling GetSecretByNameTypeWithContext
+		ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
+		defer cancel()
+		response, _, err := ibm.IBMClient.GetSecretByNameTypeWithContext(
+			ctx,
+			&sm.GetSecretByNameTypeOptions{
+				Name:            secretName,
+				SecretGroupName: &secretGroupName,
+				SecretType:      &secretType,
+			})
+		metrics.ObserveAPICall(constants.ProviderIBMSM, constants.CallIBMSMGetSecretByNameType, err)
+		if err != nil {
+			return nil, err
+		}
+		return response, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
@@ -412,41 +392,9 @@ func getSecretData(ibm *providerIBM, secretName *string, secretType, secretGroup
 	return response, nil
 }
 
-func findSecretByName(ibm *providerIBM, secretName *string, secretType string) (*string, error) {
-	var secretID *string
-	ctx, cancel := context.WithTimeout(context.Background(), contextTimeout)
-	defer cancel()
-	response, _, err := ibm.IBMClient.ListSecretsWithContext(ctx,
-		&sm.ListSecretsOptions{
-			Search: secretName,
-		})
-	metrics.ObserveAPICall(constants.ProviderIBMSM, constants.CallIBMSMListSecrets, err)
-	if err != nil {
-		return nil, err
-	}
-
-	found := 0
-	for _, r := range response.Secrets {
-		foundsecretID, foundSecretName, err := extractSecretMetadata(r, secretName, secretType)
-		if err == nil {
-			if *foundSecretName == *secretName {
-				found++
-				secretID = foundsecretID
-			}
-		}
-	}
-	if found == 0 {
-		return nil, fmt.Errorf("failed to find a secret for the given secretName %s", *secretName)
-	}
-	if found > 1 {
-		return nil, fmt.Errorf("found more than one secret matching for the given secretName %s, cannot proceed further", *secretName)
-	}
-	return secretID, nil
-}
-
 func (ibm *providerIBM) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
 	if utils.IsNil(ibm.IBMClient) {
-		return nil, fmt.Errorf(errUninitalizedIBMProvider)
+		return nil, errors.New(errUninitializedIBMProvider)
 	}
 	var secretGroupName string
 	secretType := sm.Secret_SecretType_Arbitrary
@@ -481,7 +429,7 @@ func (ibm *providerIBM) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSe
 	checkNilFn := func(propertyList []string) error {
 		for _, prop := range propertyList {
 			if _, ok := secMap[prop]; !ok {
-				return fmt.Errorf("key %s does not exist in secret %s", prop, secretName)
+				return fmt.Errorf(errKeyDoesNotExist, prop, secretName)
 			}
 		}
 		return nil
@@ -508,6 +456,13 @@ func (ibm *providerIBM) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSe
 			return nil, err
 		}
 		secretMap[apikeyConst] = secMapBytes[smAPIKeyConst]
+		return secretMap, nil
+
+	case sm.Secret_SecretType_ServiceCredentials:
+		if err := checkNilFn([]string{credentialsConst}); err != nil {
+			return nil, err
+		}
+		secretMap[credentialsConst] = secMapBytes[credentialsConst]
 		return secretMap, nil
 
 	case sm.Secret_SecretType_ImportedCert:
@@ -550,7 +505,7 @@ func (ibm *providerIBM) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSe
 		if err != nil {
 			return nil, err
 		}
-		m := make(map[string]interface{})
+		m := make(map[string]any)
 		err = json.Unmarshal(secret, &m)
 		if err != nil {
 			return nil, fmt.Errorf(errJSONSecretUnmarshal, err)
@@ -563,38 +518,15 @@ func (ibm *providerIBM) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSe
 	}
 }
 
-func byteArrayMap(secretData map[string]interface{}, secretMap map[string][]byte) map[string][]byte {
+func byteArrayMap(secretData map[string]any, secretMap map[string][]byte) map[string][]byte {
 	var err error
 	for k, v := range secretData {
-		secretMap[k], err = getTypedKey(v)
+		secretMap[k], err = utils.GetByteValue(v)
 		if err != nil {
 			return nil
 		}
 	}
 	return secretMap
-}
-
-// kudos Vault Provider - convert from various types.
-func getTypedKey(v interface{}) ([]byte, error) {
-	switch t := v.(type) {
-	case string:
-		return []byte(t), nil
-	case map[string]interface{}:
-		return json.Marshal(t)
-	case map[string]string:
-		return json.Marshal(t)
-	case []byte:
-		return t, nil
-		// also covers int and float32 due to json.Marshal
-	case float64:
-		return []byte(strconv.FormatFloat(t, 'f', -1, 64)), nil
-	case bool:
-		return []byte(strconv.FormatBool(t)), nil
-	case nil:
-		return []byte(nil), nil
-	default:
-		return nil, fmt.Errorf("secret not in expected format")
-	}
 }
 
 func (ibm *providerIBM) Close(_ context.Context) error {
@@ -605,11 +537,11 @@ func (ibm *providerIBM) Validate() (esv1beta1.ValidationResult, error) {
 	return esv1beta1.ValidationResultReady, nil
 }
 
-func (ibm *providerIBM) ValidateStore(store esv1beta1.GenericStore) error {
+func (ibm *providerIBM) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
 	storeSpec := store.GetSpec()
 	ibmSpec := storeSpec.Provider.IBM
 	if ibmSpec.ServiceURL == nil {
-		return fmt.Errorf("serviceURL is required")
+		return nil, errors.New("serviceURL is required")
 	}
 
 	containerRef := ibmSpec.Auth.ContainerAuth
@@ -621,15 +553,15 @@ func (ibm *providerIBM) ValidateStore(store esv1beta1.GenericStore) error {
 	if missingContainerRef == missingSecretRef {
 		// since both are equal, if one is missing assume both are missing
 		if missingContainerRef {
-			return fmt.Errorf("missing auth method")
+			return nil, errors.New("missing auth method")
 		}
-		return fmt.Errorf("too many auth methods defined")
+		return nil, errors.New("too many auth methods defined")
 	}
 
 	if !missingContainerRef {
 		// catch undefined container auth profile
 		if containerRef.Profile == "" {
-			return fmt.Errorf("container auth profile cannot be empty")
+			return nil, errors.New("container auth profile cannot be empty")
 		}
 
 		// proceed with container auth
@@ -637,25 +569,25 @@ func (ibm *providerIBM) ValidateStore(store esv1beta1.GenericStore) error {
 			containerRef.TokenLocation = "/var/run/secrets/tokens/vault-token"
 		}
 		if _, err := os.Open(containerRef.TokenLocation); err != nil {
-			return fmt.Errorf("cannot read container auth token %s. %w", containerRef.TokenLocation, err)
+			return nil, fmt.Errorf("cannot read container auth token %s. %w", containerRef.TokenLocation, err)
 		}
-		return nil
+		return nil, nil
 	}
 
 	// proceed with API Key Auth validation
 	secretKeyRef := secretRef.SecretAPIKey
 	err := utils.ValidateSecretSelector(store, secretKeyRef)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if secretKeyRef.Name == "" {
-		return fmt.Errorf("secretAPIKey.name cannot be empty")
+		return nil, errors.New("secretAPIKey.name cannot be empty")
 	}
 	if secretKeyRef.Key == "" {
-		return fmt.Errorf("secretAPIKey.key cannot be empty")
+		return nil, errors.New("secretAPIKey.key cannot be empty")
 	}
 
-	return nil
+	return nil, nil
 }
 
 // Capabilities return the provider supported capabilities (ReadOnly, WriteOnly, ReadWrite).
@@ -748,7 +680,6 @@ func (ibm *providerIBM) NewClient(ctx context.Context, store esv1beta1.GenericSt
 	}
 
 	ibm.IBMClient = secretsManager
-	ibm.cache = NewCache(defaultCacheSize, defaultCacheExpiry)
 	return ibm, nil
 }
 
@@ -759,15 +690,15 @@ func init() {
 }
 
 // populateSecretMap populates the secretMap with metadata information that is pulled from IBM provider.
-func populateSecretMap(secretMap map[string][]byte, secretDataMap map[string]interface{}) map[string][]byte {
+func populateSecretMap(secretMap map[string][]byte, secretDataMap map[string]any) map[string][]byte {
 	for key, value := range secretDataMap {
 		secretMap[key] = []byte(fmt.Sprintf("%v", value))
 	}
 	return secretMap
 }
 
-func formSecretMap(secretData interface{}) (map[string]interface{}, error) {
-	secretDataMap := make(map[string]interface{})
+func formSecretMap(secretData any) (map[string]any, error) {
+	secretDataMap := make(map[string]any)
 	data, err := json.Marshal(secretData)
 	if err != nil {
 		return nil, fmt.Errorf(errJSONSecretMarshal, err)

@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package scaleway
 
 import (
@@ -23,10 +24,10 @@ import (
 	"strings"
 	"time"
 
-	smapi "github.com/scaleway/scaleway-sdk-go/api/secret/v1alpha1"
+	smapi "github.com/scaleway/scaleway-sdk-go/api/secret/v1beta1"
 	"github.com/scaleway/scaleway-sdk-go/scw"
 	"github.com/tidwall/gjson"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	"github.com/external-secrets/external-secrets/pkg/find"
@@ -58,7 +59,7 @@ func (r scwSecretRef) String() string {
 func decodeScwSecretRef(key string) (*scwSecretRef, error) {
 	sepIndex := strings.IndexRune(key, ':')
 	if sepIndex < 0 {
-		return nil, fmt.Errorf("invalid secret reference: missing colon ':'")
+		return nil, errors.New("invalid secret reference: missing colon ':'")
 	}
 
 	return &scwSecretRef{
@@ -101,8 +102,13 @@ func (c *client) GetSecret(ctx context.Context, ref esv1beta1.ExternalSecretData
 	return value, nil
 }
 
-func (c *client) PushSecret(ctx context.Context, value []byte, _ *apiextensionsv1.JSON, remoteRef esv1beta1.PushRemoteRef) error {
-	scwRef, err := decodeScwSecretRef(remoteRef.GetRemoteKey())
+func (c *client) PushSecret(ctx context.Context, secret *corev1.Secret, data esv1beta1.PushSecretData) error {
+	if data.GetSecretKey() == "" {
+		return errors.New("pushing the whole secret is not yet implemented")
+	}
+
+	value := secret.Data[data.GetSecretKey()]
+	scwRef, err := decodeScwSecretRef(data.GetRemoteKey())
 	if err != nil {
 		return err
 	}
@@ -122,14 +128,14 @@ func (c *client) PushSecret(ctx context.Context, value []byte, _ *apiextensionsv
 	case refTypePath:
 		name, path, ok := splitNameAndPath(scwRef.Value)
 		if !ok {
-			return fmt.Errorf("ref is not a path")
+			return errors.New("ref is not a path")
 		}
 		listSecretReq.Name = &name
 		listSecretReq.Path = &path
 		secretName = name
 		secretPath = path
 	default:
-		return fmt.Errorf("secrets can only be pushed by name or path")
+		return errors.New("secrets can only be pushed by name or path")
 	}
 
 	var secretID string
@@ -210,7 +216,7 @@ func (c *client) PushSecret(ctx context.Context, value []byte, _ *apiextensionsv
 	return nil
 }
 
-func (c *client) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushRemoteRef) error {
+func (c *client) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushSecretRemoteRef) error {
 	scwRef, err := decodeScwSecretRef(remoteRef.GetRemoteKey())
 	if err != nil {
 		return err
@@ -228,13 +234,13 @@ func (c *client) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushRemot
 	case refTypePath:
 		name, path, ok := splitNameAndPath(scwRef.Value)
 		if !ok {
-			return fmt.Errorf("ref is not a path")
+			return errors.New("ref is not a path")
 		}
 		listSecretReq.Name = &name
 		listSecretReq.Path = &path
 
 	default:
-		return fmt.Errorf("secrets can only be deleted by name or path")
+		return errors.New("secrets can only be deleted by name or path")
 	}
 
 	listSecrets, err := c.api.ListSecrets(listSecretReq, scw.WithContext(ctx))
@@ -256,6 +262,10 @@ func (c *client) DeleteSecret(ctx context.Context, remoteRef esv1beta1.PushRemot
 	}
 
 	return nil
+}
+
+func (c *client) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New("not implemented")
 }
 
 func (c *client) Validate() (esv1beta1.ValidationResult, error) {
@@ -329,8 +339,8 @@ func (c *client) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecret
 			return nil, err
 		}
 
-		totalFetched := uint64(*request.Page-1)*uint64(*request.PageSize) + uint64(len(response.Secrets))
-		done = totalFetched == uint64(response.TotalCount)
+		totalFetched := c.safeConvertInt32(request.Page)*uint64(*request.PageSize) + uint64(len(response.Secrets))
+		done = totalFetched == response.TotalCount
 
 		*request.Page++
 
@@ -358,6 +368,14 @@ func (c *client) GetAllSecrets(ctx context.Context, ref esv1beta1.ExternalSecret
 	return results, nil
 }
 
+func (c *client) safeConvertInt32(page *int32) uint64 {
+	if *page-1 < 0 {
+		return 0
+	}
+
+	return uint64(*page - 1) //nolint:gosec // already checked above
+}
+
 func (c *client) Close(context.Context) error {
 	return nil
 }
@@ -365,7 +383,7 @@ func (c *client) Close(context.Context) error {
 func (c *client) accessSecretVersion(ctx context.Context, secretRef *scwSecretRef, versionSpec string) ([]byte, error) {
 	// if we have a secret id and a revision number, we can avoid an extra GetSecret()
 
-	if secretRef.RefType == refTypeID && len(versionSpec) > 0 && '0' <= versionSpec[0] && versionSpec[0] <= '9' {
+	if secretRef.RefType == refTypeID && versionSpec != "" && '0' <= versionSpec[0] && versionSpec[0] <= '9' {
 		secretID := secretRef.Value
 
 		revision, err := strconv.ParseUint(versionSpec, 10, 32)
@@ -398,7 +416,7 @@ func (c *client) accessSecretVersion(ctx context.Context, secretRef *scwSecretRe
 	case refTypePath:
 		name, path, ok := splitNameAndPath(secretRef.Value)
 		if !ok {
-			return nil, fmt.Errorf("ref is not a path")
+			return nil, errors.New("ref is not a path")
 		}
 
 		request.Name = &name

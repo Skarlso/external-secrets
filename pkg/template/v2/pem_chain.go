@@ -24,13 +24,14 @@ SOFTWARE
 Original Author: Anish Ramasekar https://github.com/aramase
 In: https://github.com/Azure/secrets-store-csi-driver-provider-azure/pull/332
 */
+
 package template
 
 import (
 	"bytes"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
+	"errors"
 )
 
 const (
@@ -46,9 +47,8 @@ type node struct {
 	isParent bool
 }
 
-func fetchCertChains(data []byte) ([]byte, error) {
+func fetchX509CertChains(data []byte) ([]*x509.Certificate, error) {
 	var newCertChain []*x509.Certificate
-	var pemData []byte
 	nodes, err := pemToNodes(data)
 	if err != nil {
 		return nil, err
@@ -79,7 +79,7 @@ func fetchCertChains(data []byte) ([]byte, error) {
 	for i := range nodes {
 		if !nodes[i].isParent {
 			if foundLeaf {
-				return nil, fmt.Errorf(errFoundDisjunctCert)
+				return nil, errors.New(errFoundDisjunctCert)
 			}
 			// this is the leaf node as it's not a parent for any other node
 			leaf = nodes[i]
@@ -88,7 +88,7 @@ func fetchCertChains(data []byte) ([]byte, error) {
 	}
 
 	if leaf == nil {
-		return nil, fmt.Errorf(errNoLeafFound)
+		return nil, errors.New(errNoLeafFound)
 	}
 
 	processedNodes := 0
@@ -97,12 +97,20 @@ func fetchCertChains(data []byte) ([]byte, error) {
 		processedNodes++
 		// ensure we aren't stuck in a cyclic loop
 		if processedNodes > len(nodes) {
-			return pemData, fmt.Errorf(errChainCycle)
+			return nil, errors.New(errChainCycle)
 		}
 		newCertChain = append(newCertChain, leaf.cert)
 		leaf = leaf.parent
 	}
+	return newCertChain, nil
+}
 
+func fetchCertChains(data []byte) ([]byte, error) {
+	var pemData []byte
+	newCertChain, err := fetchX509CertChains(data)
+	if err != nil {
+		return nil, err
+	}
 	for _, cert := range newCertChain {
 		b := &pem.Block{
 			Type:  pemTypeCertificate,
@@ -130,7 +138,7 @@ func pemToNodes(data []byte) ([]*node, error) {
 		// this should not be the case because ParseCertificate should return a non nil
 		// certificate when there is no error.
 		if cert == nil {
-			return nil, fmt.Errorf(errNilCert)
+			return nil, errors.New(errNilCert)
 		}
 		nodes = append(nodes, &node{
 			cert:     cert,

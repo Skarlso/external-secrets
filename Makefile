@@ -5,7 +5,7 @@ SHELL         := /bin/bash
 MAKEFLAGS     += --warn-undefined-variables
 .SHELLFLAGS   := -euo pipefail -c
 
-ARCH ?= amd64 arm64
+ARCH ?= amd64 arm64 ppc64le
 BUILD_ARGS ?= CGO_ENABLED=0
 DOCKER_BUILD_ARGS ?=
 DOCKERFILE ?= Dockerfile
@@ -72,7 +72,7 @@ FAIL	= (echo ${TIME} ${RED}[FAIL]${CNone} && false)
 # ====================================================================================
 # Conformance
 
-reviewable: generate docs manifests helm.generate helm.docs lint ## Ensure a PR is ready for review.
+reviewable: generate docs manifests helm.generate helm.schema.update helm.docs lint ## Ensure a PR is ready for review.
 	@go mod tidy
 	@cd e2e/ && go mod tidy
 
@@ -146,6 +146,7 @@ run: generate ## Run app locally (without a k8s cluster)
 
 manifests: helm.generate ## Generate manifests from helm chart
 	mkdir -p $(OUTPUT_DIR)/deploy/manifests
+	helm dependency build $(HELM_DIR)
 	helm template external-secrets $(HELM_DIR) -f deploy/manifests/helm-values.yaml > $(OUTPUT_DIR)/deploy/manifests/external-secrets.yaml
 
 crds.install: generate ## Install CRDs into a cluster. This is for convenience
@@ -154,12 +155,15 @@ crds.install: generate ## Install CRDs into a cluster. This is for convenience
 crds.uninstall: ## Uninstall CRDs from a cluster. This is for convenience
 	kubectl delete -f $(BUNDLE_DIR)
 
+tilt-up: tilt manifests ## Generates the local manifests that tilt will use to deploy the controller's objects.
+	$(LOCALBIN)/tilt up
+
 # ====================================================================================
 # Helm Chart
 
 helm.docs: ## Generate helm docs
 	@cd $(HELM_DIR); \
-	docker run --rm -v $(shell pwd)/$(HELM_DIR):/helm-docs -u $(shell id -u) jnorwood/helm-docs:v1.5.0
+	docker run --rm -v $(shell pwd)/$(HELM_DIR):/helm-docs -u $(shell id -u) jnorwood/helm-docs:v1.7.0
 
 HELM_VERSION ?= $(shell helm show chart $(HELM_DIR) | grep 'version:' | sed 's/version: //g')
 
@@ -168,6 +172,16 @@ helm.build: helm.generate ## Build helm chart
 	@helm package $(HELM_DIR) --dependency-update --destination $(OUTPUT_DIR)/chart
 	@mv $(OUTPUT_DIR)/chart/external-secrets-$(HELM_VERSION).tgz $(OUTPUT_DIR)/chart/external-secrets.tgz
 	@$(OK) helm package
+
+helm.schema.plugin:
+	@$(INFO) Installing helm-values-schema-json plugin
+	@helm plugin install https://github.com/losisin/helm-values-schema-json.git || true
+	@$(OK) Installed helm-values-schema-json plugin
+
+helm.schema.update: helm.schema.plugin
+	@$(INFO) Generating values.schema.json
+	@helm schema -input $(HELM_DIR)/values.yaml -output $(HELM_DIR)/values.schema.json
+	@$(OK) Generated values.schema.json
 
 helm.generate:
 	./hack/helm.generate.sh $(BUNDLE_DIR) $(HELM_DIR)
@@ -254,22 +268,22 @@ docker.promote: ## Promote the docker image to the registry
 # ====================================================================================
 # Terraform
 
-tf.plan.%: ## Runs terrform plan for a provider
+tf.plan.%: ## Runs terraform plan for a provider
 	@cd $(TF_DIR)/$*; \
 	terraform init; \
 	terraform plan
 
-tf.apply.%: ## Runs terrform apply for a provider
+tf.apply.%: ## Runs terraform apply for a provider
 	@cd $(TF_DIR)/$*; \
 	terraform init; \
 	terraform apply -auto-approve
 
-tf.destroy.%: ## Runs terrform destroy for a provider
+tf.destroy.%: ## Runs terraform destroy for a provider
 	@cd $(TF_DIR)/$*; \
 	terraform init; \
 	terraform destroy -auto-approve
 
-tf.show.%: ## Runs terrform show for a provider and outputs to a file
+tf.show.%: ## Runs terraform show for a provider and outputs to a file
 	@cd $(TF_DIR)/$*; \
 	terraform init; \
 	terraform plan -out tfplan.binary; \
@@ -293,18 +307,34 @@ clean:  ## Clean bins
 # ====================================================================================
 # Build Dependencies
 
+ifeq ($(OS),Windows_NT)     # is Windows_NT on XP, 2000, 7, Vista, 10...
+    detected_OS := windows
+    arch := x86_64
+else
+    detected_OS := $(shell uname -s)
+    arch := $(shell uname -m)
+    ifeq ($(detected_OS),Darwin)
+    	detected_OS := mac
+    endif
+    ifeq ($(detected_OS),Linux)
+    	detected_OS := linux
+    endif
+endif
+
 ## Location to install dependencies to
 LOCALBIN ?= $(shell pwd)/bin
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 ## Tool Binaries
+TILT ?= $(LOCALBIN)/tilt
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 
 ## Tool Versions
-GOLANGCI_VERSION := 1.52.2
-KUBERNETES_VERSION := 1.28.x
+GOLANGCI_VERSION := 1.61.0
+KUBERNETES_VERSION := 1.30.x
+TILT_VERSION := 0.33.21
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download envtest-setup locally if necessary.
@@ -317,3 +347,9 @@ golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	test -s $(LOCALBIN)/golangci-lint && $(LOCALBIN)/golangci-lint version --format short | grep -q $(GOLANGCI_VERSION) || \
 	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(LOCALBIN) v$(GOLANGCI_VERSION)
+
+.PHONY: tilt
+.PHONY: $(TILT)
+tilt: $(TILT) ## Download tilt locally if necessary. Architecture is locked at x86_64.
+$(TILT): $(LOCALBIN)
+	test -s $(LOCALBIN)/tilt || curl -fsSL https://github.com/tilt-dev/tilt/releases/download/v$(TILT_VERSION)/tilt.$(TILT_VERSION).$(detected_OS).$(arch).tar.gz | tar -xz -C $(LOCALBIN) tilt

@@ -11,10 +11,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package secretmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 	"google.golang.org/api/option"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	"github.com/external-secrets/external-secrets/pkg/utils"
@@ -58,7 +61,7 @@ func (p *Provider) Capabilities() esv1beta1.SecretStoreCapabilities {
 func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, kube kclient.Client, namespace string) (esv1beta1.SecretsClient, error) {
 	storeSpec := store.GetSpec()
 	if storeSpec == nil || storeSpec.Provider == nil || storeSpec.Provider.GCPSM == nil {
-		return nil, fmt.Errorf(errGCPSMStore)
+		return nil, errors.New(errGCPSMStore)
 	}
 	gcpStore := storeSpec.Provider.GCPSM
 
@@ -90,7 +93,7 @@ func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, 
 		return client, nil
 	}
 
-	ts, err := NewTokenSource(ctx, gcpStore.Auth, clusterProjectID, isClusterKind, kube, namespace)
+	ts, err := NewTokenSource(ctx, gcpStore.Auth, clusterProjectID, store.GetKind(), kube, namespace)
 	if err != nil {
 		return nil, fmt.Errorf(errUnableCreateGCPSMClient, err)
 	}
@@ -109,32 +112,32 @@ func (p *Provider) NewClient(ctx context.Context, store esv1beta1.GenericStore, 
 	return client, nil
 }
 
-func (p *Provider) ValidateStore(store esv1beta1.GenericStore) error {
+func (p *Provider) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
 	if store == nil {
-		return fmt.Errorf(errInvalidStore)
+		return nil, errors.New(errInvalidStore)
 	}
 	spc := store.GetSpec()
 	if spc == nil {
-		return fmt.Errorf(errInvalidStoreSpec)
+		return nil, errors.New(errInvalidStoreSpec)
 	}
 	if spc.Provider == nil {
-		return fmt.Errorf(errInvalidStoreProv)
+		return nil, errors.New(errInvalidStoreProv)
 	}
 	g := spc.Provider.GCPSM
 	if p == nil {
-		return fmt.Errorf(errInvalidGCPProv)
+		return nil, errors.New(errInvalidGCPProv)
 	}
 	if g.Auth.SecretRef != nil {
 		if err := utils.ValidateReferentSecretSelector(store, g.Auth.SecretRef.SecretAccessKey); err != nil {
-			return fmt.Errorf(errInvalidAuthSecretRef, err)
+			return nil, fmt.Errorf(errInvalidAuthSecretRef, err)
 		}
 	}
 	if g.Auth.WorkloadIdentity != nil {
 		if err := utils.ValidateReferentServiceAccountSelector(store, g.Auth.WorkloadIdentity.ServiceAccountRef); err != nil {
-			return fmt.Errorf(errInvalidWISARef, err)
+			return nil, fmt.Errorf(errInvalidWISARef, err)
 		}
 	}
-	return nil
+	return nil, nil
 }
 
 func clusterProjectID(spec *esv1beta1.SecretStoreSpec) (string, error) {
@@ -143,7 +146,7 @@ func clusterProjectID(spec *esv1beta1.SecretStoreSpec) (string, error) {
 	} else if spec.Provider.GCPSM.ProjectID != "" {
 		return spec.Provider.GCPSM.ProjectID, nil
 	} else {
-		return "", fmt.Errorf(errNoProjectID)
+		return "", errors.New(errNoProjectID)
 	}
 }
 

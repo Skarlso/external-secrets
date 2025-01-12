@@ -12,14 +12,29 @@ way users of the `SecretStore` can only access the secrets necessary.
 {% include 'aws-sm-store.yaml' %}
 ```
 **NOTE:** In case of a `ClusterSecretStore`, Be sure to provide `namespace` in `accessKeyIDSecretRef` and `secretAccessKeySecretRef`  with the namespaces where the secrets reside.
+
+**NOTE:** When using `dataFrom` without a `path` defined, the provider will fall back to using `ListSecrets`. `ListSecrets`
+then proceeds to fetch each individual secret in turn. To use `BatchGetSecretValue` and avoid excessive API calls define
+a `path` prefix or use `Tags` filter.
+
 ### IAM Policy
 
 Create a IAM Policy to pin down access to secrets matching `dev-*`.
+
+For Batch permissions read the following post https://aws.amazon.com/about-aws/whats-new/2023/11/aws-secrets-manager-batch-retrieval-secrets/.
 
 ``` json
 {
   "Version": "2012-10-17",
   "Statement": [
+    {
+      "Action" : [
+        "secretsmanager:ListSecrets",
+        "secretsmanager:BatchGetSecretValue"
+      ],
+      "Effect" : "Allow",
+      "Resource" : "*"
+    },
     {
       "Effect": "Allow",
       "Action": [
@@ -91,6 +106,26 @@ Here's a more restrictive version of the IAM policy:
 ```
 
 In this policy, the DeleteSecret action is restricted to secrets that have the specified tag, ensuring that deletion operations are more controlled and in line with the intended management of the secrets.
+
+#### Additional Settings for PushSecret
+
+Additional settings can be set at the `SecretStore` level to control the behavior of `PushSecret` when interacting with AWS Secrets Manager.
+
+```yaml
+{% include 'aws-sm-store-secretsmanager-config.yaml' %}
+```
+
+#### Additional Metadata for PushSecret
+
+It's possible to configure AWS Secrets Manager to either push secrets in `binary` format or as plain `string`.
+
+To control this behaviour set the following provider metadata:
+
+```yaml
+{% include 'aws-sm-push-secret-with-metadata.yaml' %}
+```
+
+`secretPushFormat` takes two options. `binary` and `string`, where `binary` is the _default_.
 
 ### JSON Secret Values
 

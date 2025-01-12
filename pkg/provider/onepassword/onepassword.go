@@ -11,24 +11,29 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package onepassword
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
+	"strings"
+	"time"
 
 	"github.com/1Password/connect-sdk-go/connect"
 	"github.com/1Password/connect-sdk-go/onepassword"
 	corev1 "k8s.io/api/core/v1"
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/types"
 	kclient "sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	"github.com/external-secrets/external-secrets/pkg/find"
 	"github.com/external-secrets/external-secrets/pkg/utils"
+	"github.com/external-secrets/external-secrets/pkg/utils/metadata"
+	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
 )
 
 const (
@@ -43,20 +48,39 @@ const (
 	errOnePasswordStoreAtLeastOneVault            = "must be at least one vault: spec.provider.onepassword.vaults"
 	errOnePasswordStoreInvalidConnectHost         = "unable to parse URL: spec.provider.onepassword.connectHost: %w"
 	errOnePasswordStoreNonUniqueVaultNumbers      = "vault order numbers must be unique"
-	errFetchK8sSecret                             = "could not fetch ConnectToken Secret: %w"
-	errMissingToken                               = "missing Secret Token"
 	errGetVault                                   = "error finding 1Password Vault: %w"
-	errExpectedOneItem                            = "expected one 1Password Item matching %w"
-	errGetItem                                    = "error finding 1Password Item: %w"
-	errKeyNotFound                                = "key not found in 1Password Vaults: %w"
-	errDocumentNotFound                           = "error finding 1Password Document: %w"
-	errExpectedOneField                           = "expected one 1Password ItemField matching %w"
-	errTagsNotImplemented                         = "'find.tags' is not implemented in the 1Password provider"
-	errVersionNotImplemented                      = "'remoteRef.version' is not implemented in the 1Password provider"
 
-	documentCategory      = "DOCUMENT"
-	fieldsWithLabelFormat = "'%s' in '%s', got %d"
-	incorrectCountFormat  = "'%s', got %d"
+	errGetItem               = "error finding 1Password Item: %w"
+	errUpdateItem            = "error updating 1Password Item: %w"
+	errDocumentNotFound      = "error finding 1Password Document: %w"
+	errTagsNotImplemented    = "'find.tags' is not implemented in the 1Password provider"
+	errVersionNotImplemented = "'remoteRef.version' is not implemented in the 1Password provider"
+	errCreateItem            = "error creating 1Password Item: %w"
+	errDeleteItem            = "error deleting 1Password Item: %w"
+	// custom error messages.
+	errKeyNotFoundMsg             = "key not found in 1Password Vaults"
+	errNoVaultsMsg                = "no vaults found"
+	errMetadataVaultNotinProvider = "metadata vault '%s' not in provider vaults"
+	errExpectedOneItemMsg         = "expected one 1Password Item matching"
+	errExpectedOneFieldMsg        = "expected one 1Password ItemField matching"
+	errExpectedOneFieldMsgF       = "%w: '%s' in '%s', got %d"
+
+	documentCategory = "DOCUMENT"
+	fieldPrefix      = "field"
+	filePrefix       = "file"
+	prefixSplitter   = "/"
+)
+
+// Custom Errors //.
+var (
+	// ErrKeyNotFound is returned when a key is not found in the 1Password Vaults.
+	ErrKeyNotFound = errors.New(errKeyNotFoundMsg)
+	// ErrNoVaults is returned when no vaults are found in the 1Password provider.
+	ErrNoVaults = errors.New(errNoVaultsMsg)
+	// ErrExpectedOneField is returned when more than 1 field is found in the 1Password Vaults.
+	ErrExpectedOneField = errors.New(errExpectedOneFieldMsg)
+	// ErrExpectedOneItem is returned when more than 1 item is found in the 1Password Vaults.
+	ErrExpectedOneItem = errors.New(errExpectedOneItemMsg)
 )
 
 // ProviderOnePassword is a provider for 1Password.
@@ -65,9 +89,16 @@ type ProviderOnePassword struct {
 	client connect.Client
 }
 
+type PushSecretMetadataSpec struct {
+	Tags  []string `json:"tags,omitempty"`
+	Vault string   `json:"vault,omitempty"`
+}
+
 // https://github.com/external-secrets/external-secrets/issues/644
-var _ esv1beta1.SecretsClient = &ProviderOnePassword{}
-var _ esv1beta1.Provider = &ProviderOnePassword{}
+var (
+	_ esv1beta1.SecretsClient = &ProviderOnePassword{}
+	_ esv1beta1.Provider      = &ProviderOnePassword{}
+)
 
 // Capabilities return the provider supported capabilities (ReadOnly, WriteOnly, ReadWrite).
 func (provider *ProviderOnePassword) Capabilities() esv1beta1.SecretStoreCapabilities {
@@ -77,57 +108,46 @@ func (provider *ProviderOnePassword) Capabilities() esv1beta1.SecretStoreCapabil
 // NewClient constructs a 1Password Provider.
 func (provider *ProviderOnePassword) NewClient(ctx context.Context, store esv1beta1.GenericStore, kube kclient.Client, namespace string) (esv1beta1.SecretsClient, error) {
 	config := store.GetSpec().Provider.OnePassword
-
-	credentialsSecret := &corev1.Secret{}
-	objectKey := types.NamespacedName{
-		Name:      config.Auth.SecretRef.ConnectToken.Name,
-		Namespace: namespace,
-	}
-
-	// only ClusterSecretStore is allowed to set namespace (and then it's required)
-	if store.GetObjectKind().GroupVersionKind().Kind == esv1beta1.ClusterSecretStoreKind {
-		objectKey.Namespace = *config.Auth.SecretRef.ConnectToken.Namespace
-	}
-
-	err := kube.Get(ctx, objectKey, credentialsSecret)
+	token, err := resolvers.SecretKeyRef(
+		ctx,
+		kube,
+		store.GetKind(),
+		namespace,
+		&config.Auth.SecretRef.ConnectToken,
+	)
 	if err != nil {
-		return nil, fmt.Errorf(errFetchK8sSecret, err)
+		return nil, err
 	}
-	token := credentialsSecret.Data[config.Auth.SecretRef.ConnectToken.Key]
-	if (token == nil) || (len(token) == 0) {
-		return nil, fmt.Errorf(errMissingToken)
-	}
-	provider.client = connect.NewClientWithUserAgent(config.ConnectHost, string(token), userAgent)
+	provider.client = connect.NewClientWithUserAgent(config.ConnectHost, token, userAgent)
 	provider.vaults = config.Vaults
-
 	return provider, nil
 }
 
 // ValidateStore checks if the provided store is valid.
-func (provider *ProviderOnePassword) ValidateStore(store esv1beta1.GenericStore) error {
-	return validateStore(store)
+func (provider *ProviderOnePassword) ValidateStore(store esv1beta1.GenericStore) (admission.Warnings, error) {
+	return nil, validateStore(store)
 }
 
 func validateStore(store esv1beta1.GenericStore) error {
 	// check nils
 	storeSpec := store.GetSpec()
 	if storeSpec == nil {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreNilSpec))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreNilSpec))
 	}
 	if storeSpec.Provider == nil {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreNilSpecProvider))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreNilSpecProvider))
 	}
 	if storeSpec.Provider.OnePassword == nil {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreNilSpecProviderOnePassword))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreNilSpecProviderOnePassword))
 	}
 
 	// check mandatory fields
 	config := storeSpec.Provider.OnePassword
 	if config.Auth.SecretRef.ConnectToken.Name == "" {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreMissingRefName))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreMissingRefName))
 	}
 	if config.Auth.SecretRef.ConnectToken.Key == "" {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreMissingRefKey))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreMissingRefKey))
 	}
 
 	// check namespace compared to kind
@@ -137,12 +157,12 @@ func validateStore(store esv1beta1.GenericStore) error {
 
 	// check at least one vault
 	if len(config.Vaults) == 0 {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreAtLeastOneVault))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreAtLeastOneVault))
 	}
 
 	// ensure vault numbers are unique
 	if !hasUniqueVaultNumbers(config.Vaults) {
-		return fmt.Errorf(errOnePasswordStore, fmt.Errorf(errOnePasswordStoreNonUniqueVaultNumbers))
+		return fmt.Errorf(errOnePasswordStore, errors.New(errOnePasswordStoreNonUniqueVaultNumbers))
 	}
 
 	// check valid URL
@@ -153,19 +173,224 @@ func validateStore(store esv1beta1.GenericStore) error {
 	return nil
 }
 
-func (provider *ProviderOnePassword) DeleteSecret(_ context.Context, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func deleteField(fields []*onepassword.ItemField, label string) ([]*onepassword.ItemField, error) {
+	// This will always iterate over all items
+	// but its done to ensure that two fields with the same label
+	// exist resulting in undefined behavior
+	var (
+		found   bool
+		fieldsF = make([]*onepassword.ItemField, 0, len(fields))
+	)
+	for _, item := range fields {
+		if item.Label == label {
+			if found {
+				return nil, ErrExpectedOneField
+			}
+			found = true
+			continue
+		}
+		fieldsF = append(fieldsF, item)
+	}
+	return fieldsF, nil
 }
 
-// Not Implemented PushSecret.
-func (provider *ProviderOnePassword) PushSecret(_ context.Context, _ []byte, _ *apiextensionsv1.JSON, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (provider *ProviderOnePassword) DeleteSecret(_ context.Context, ref esv1beta1.PushSecretRemoteRef) error {
+	providerItem, err := provider.findItem(ref.GetRemoteKey())
+	if err != nil {
+		return err
+	}
+
+	providerItem.Fields, err = deleteField(providerItem.Fields, ref.GetProperty())
+	if err != nil {
+		return fmt.Errorf(errUpdateItem, err)
+	}
+
+	if len(providerItem.Fields) == 0 && len(providerItem.Files) == 0 && len(providerItem.Sections) == 0 {
+		// Delete the item if there are no fields, files or sections
+		if err = provider.client.DeleteItem(providerItem, providerItem.Vault.ID); err != nil {
+			return fmt.Errorf(errDeleteItem, err)
+		}
+		return nil
+	}
+
+	if _, err = provider.client.UpdateItem(providerItem, providerItem.Vault.ID); err != nil {
+		return fmt.Errorf(errDeleteItem, err)
+	}
+	return nil
+}
+
+func (provider *ProviderOnePassword) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errors.New("not implemented")
+}
+
+const (
+	passwordLabel = "password"
+)
+
+// createItem creates a new item in the first vault. If no vaults exist, it returns an error.
+func (provider *ProviderOnePassword) createItem(val []byte, ref esv1beta1.PushSecretData) error {
+	// Get the metadata
+	metadata, err := metadata.ParseMetadataParameters[PushSecretMetadataSpec](ref.GetMetadata())
+	if err != nil {
+		return fmt.Errorf("failed to parse push secret metadata: %w", err)
+	}
+
+	// Check if there is a vault is specified in the metadata
+	vaultID := ""
+	if metadata != nil && metadata.Spec.Vault != "" {
+		// check if metadata.Spec.Vault is in provider.vaults
+		if _, ok := provider.vaults[metadata.Spec.Vault]; !ok {
+			return fmt.Errorf(errMetadataVaultNotinProvider, metadata.Spec.Vault)
+		}
+		vaultID = metadata.Spec.Vault
+	} else {
+		// Get the first vault from the provider
+		sortedVaults := sortVaults(provider.vaults)
+		if len(sortedVaults) == 0 {
+			return ErrNoVaults
+		}
+		vaultID = sortedVaults[0]
+	}
+
+	// Get the label
+	label := ref.GetProperty()
+	if label == "" {
+		label = passwordLabel
+	}
+
+	var tags []string
+	if metadata != nil && metadata.Spec.Tags != nil {
+		tags = metadata.Spec.Tags
+	}
+
+	// Create the item
+	item := &onepassword.Item{
+		Title:    ref.GetRemoteKey(),
+		Category: onepassword.Server,
+		Vault: onepassword.ItemVault{
+			ID: vaultID,
+		},
+		Fields: []*onepassword.ItemField{
+			generateNewItemField(label, string(val)),
+		},
+		Tags: tags,
+	}
+
+	_, err = provider.client.CreateItem(item, vaultID)
+	return err
+}
+
+// updateFieldValue updates the fields value of an item with the given label.
+// If the label does not exist, a new field is created. If the label exists but
+// the value is different, the value is updated. If the label exists and the
+// value is the same, nothing is done.
+func updateFieldValue(fields []*onepassword.ItemField, label, newVal string) ([]*onepassword.ItemField, error) {
+	// This will always iterate over all items.
+	// This is done to ensure that two fields with the same label
+	// exist resulting in undefined behavior.
+	var (
+		found bool
+		index int
+	)
+	for i, item := range fields {
+		if item.Label == label {
+			if found {
+				return nil, ErrExpectedOneField
+			}
+			found = true
+			index = i
+		}
+	}
+	if !found {
+		return append(fields, generateNewItemField(label, newVal)), nil
+	}
+
+	if fields[index].Value != newVal {
+		fields[index].Value = newVal
+	}
+
+	return fields, nil
+}
+
+// generateNewItemField generates a new item field with the given label and value.
+func generateNewItemField(label, newVal string) *onepassword.ItemField {
+	field := &onepassword.ItemField{
+		Label: label,
+		Value: newVal,
+		Type:  onepassword.FieldTypeConcealed,
+	}
+
+	return field
+}
+
+func (provider *ProviderOnePassword) PushSecret(ctx context.Context, secret *corev1.Secret, ref esv1beta1.PushSecretData) error {
+	val, ok := secret.Data[ref.GetSecretKey()]
+	if !ok {
+		return ErrKeyNotFound
+	}
+
+	title := ref.GetRemoteKey()
+	providerItem, err := provider.findItem(title)
+	if errors.Is(err, ErrKeyNotFound) {
+		if err = provider.createItem(val, ref); err != nil {
+			return fmt.Errorf(errCreateItem, err)
+		}
+
+		err = provider.waitForFunc(ctx, provider.waitForItemToExist(title))
+		return err
+	} else if err != nil {
+		return err
+	}
+
+	label := ref.GetProperty()
+	if label == "" {
+		label = passwordLabel
+	}
+
+	metadata, err := metadata.ParseMetadataParameters[PushSecretMetadataSpec](ref.GetMetadata())
+	if err != nil {
+		return fmt.Errorf("failed to parse push secret metadata: %w", err)
+	}
+	if metadata != nil && metadata.Spec.Tags != nil {
+		providerItem.Tags = metadata.Spec.Tags
+	}
+
+	providerItem.Fields, err = updateFieldValue(providerItem.Fields, label, string(val))
+	if err != nil {
+		return fmt.Errorf(errUpdateItem, err)
+	}
+
+	if _, err = provider.client.UpdateItem(providerItem, providerItem.Vault.ID); err != nil {
+		return fmt.Errorf(errUpdateItem, err)
+	}
+
+	if err := provider.waitForFunc(ctx, provider.waitForLabelToBeUpdated(title, label, val)); err != nil {
+		return fmt.Errorf("failed waiting for label update: %w", err)
+	}
+
+	return nil
+}
+
+// Clean property string by removing property prefix if needed.
+func getObjType(documentType onepassword.ItemCategory, property string) (string, string) {
+	if strings.HasPrefix(property, fieldPrefix+prefixSplitter) {
+		return fieldPrefix, property[6:]
+	}
+	if strings.HasPrefix(property, filePrefix+prefixSplitter) {
+		return filePrefix, property[5:]
+	}
+
+	if documentType == documentCategory {
+		return filePrefix, property
+	}
+
+	return fieldPrefix, property
 }
 
 // GetSecret returns a single secret from the provider.
 func (provider *ProviderOnePassword) GetSecret(_ context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) ([]byte, error) {
 	if ref.Version != "" {
-		return nil, fmt.Errorf(errVersionNotImplemented)
+		return nil, errors.New(errVersionNotImplemented)
 	}
 
 	item, err := provider.findItem(ref.Key)
@@ -173,14 +398,11 @@ func (provider *ProviderOnePassword) GetSecret(_ context.Context, ref esv1beta1.
 		return nil, err
 	}
 
-	// handle files
-	if item.Category == documentCategory {
-		// default to the first file when ref.Property is empty
-		return provider.getFile(item, ref.Property)
+	propertyType, property := getObjType(item.Category, ref.Property)
+	if propertyType == filePrefix {
+		return provider.getFile(item, property)
 	}
-
-	// handle fields
-	return provider.getField(item, ref.Property)
+	return provider.getField(item, property)
 }
 
 // Validate checks if the client is configured correctly
@@ -199,7 +421,7 @@ func (provider *ProviderOnePassword) Validate() (esv1beta1.ValidationResult, err
 // GetSecretMap returns multiple k/v pairs from the provider, for dataFrom.extract.
 func (provider *ProviderOnePassword) GetSecretMap(_ context.Context, ref esv1beta1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
 	if ref.Version != "" {
-		return nil, fmt.Errorf(errVersionNotImplemented)
+		return nil, errors.New(errVersionNotImplemented)
 	}
 
 	item, err := provider.findItem(ref.Key)
@@ -207,19 +429,17 @@ func (provider *ProviderOnePassword) GetSecretMap(_ context.Context, ref esv1bet
 		return nil, err
 	}
 
-	// handle files
-	if item.Category == documentCategory {
-		return provider.getFiles(item, ref.Property)
+	propertyType, property := getObjType(item.Category, ref.Property)
+	if propertyType == filePrefix {
+		return provider.getFiles(item, property)
 	}
-
-	// handle fields
-	return provider.getFields(item, ref.Property)
+	return provider.getFields(item, property)
 }
 
 // GetAllSecrets syncs multiple 1Password Items into a single Kubernetes Secret, for dataFrom.find.
 func (provider *ProviderOnePassword) GetAllSecrets(_ context.Context, ref esv1beta1.ExternalSecretFind) (map[string][]byte, error) {
 	if ref.Tags != nil {
-		return nil, fmt.Errorf(errTagsNotImplemented)
+		return nil, errors.New(errTagsNotImplemented)
 	}
 
 	secretData := make(map[string][]byte)
@@ -261,11 +481,11 @@ func (provider *ProviderOnePassword) findItem(name string) (*onepassword.Item, e
 		case len(items) == 1:
 			return provider.client.GetItemByUUID(items[0].ID, items[0].Vault.ID)
 		case len(items) > 1:
-			return nil, fmt.Errorf(errExpectedOneItem, fmt.Errorf(incorrectCountFormat, name, len(items)))
+			return nil, fmt.Errorf("%w: '%s', got %d", ErrExpectedOneItem, name, len(items))
 		}
 	}
 
-	return nil, fmt.Errorf(errKeyNotFound, fmt.Errorf("%s in: %v", name, provider.vaults))
+	return nil, fmt.Errorf("%w: %s in: %v", ErrKeyNotFound, name, provider.vaults)
 }
 
 func (provider *ProviderOnePassword) getField(item *onepassword.Item, property string) ([]byte, error) {
@@ -276,7 +496,7 @@ func (provider *ProviderOnePassword) getField(item *onepassword.Item, property s
 	}
 
 	if length := countFieldsWithLabel(fieldLabel, item.Fields); length != 1 {
-		return nil, fmt.Errorf(errExpectedOneField, fmt.Errorf(fieldsWithLabelFormat, fieldLabel, item.Title, length))
+		return nil, fmt.Errorf("%w: '%s' in '%s', got %d", ErrExpectedOneField, fieldLabel, item.Title, length)
 	}
 
 	// caution: do not use client.GetValue here because it has undesirable behavior on keys with a dot in them
@@ -298,7 +518,7 @@ func (provider *ProviderOnePassword) getFields(item *onepassword.Item, property 
 			continue
 		}
 		if length := countFieldsWithLabel(field.Label, item.Fields); length != 1 {
-			return nil, fmt.Errorf(errExpectedOneField, fmt.Errorf(fieldsWithLabelFormat, field.Label, item.Title, length))
+			return nil, fmt.Errorf(errExpectedOneFieldMsgF, ErrExpectedOneField, field.Label, item.Title, length)
 		}
 
 		// caution: do not use client.GetValue here because it has undesirable behavior on keys with a dot in them
@@ -316,7 +536,7 @@ func (provider *ProviderOnePassword) getAllFields(item onepassword.Item, ref esv
 	item = *i
 	for _, field := range item.Fields {
 		if length := countFieldsWithLabel(field.Label, item.Fields); length != 1 {
-			return fmt.Errorf(errExpectedOneField, fmt.Errorf(fieldsWithLabelFormat, field.Label, item.Title, length))
+			return fmt.Errorf(errExpectedOneFieldMsgF, ErrExpectedOneField, field.Label, item.Title, length)
 		}
 		if ref.Name != nil {
 			matcher, err := find.New(*ref.Name)
@@ -401,13 +621,9 @@ func (provider *ProviderOnePassword) getAllForVault(vaultID string, ref esv1beta
 		}
 
 		// handle files
-		if item.Category == documentCategory {
-			err = provider.getAllFiles(item, ref, secretData)
-			if err != nil {
-				return err
-			}
-
-			continue
+		err = provider.getAllFiles(item, ref, secretData)
+		if err != nil {
+			return err
 		}
 
 		// handle fields
@@ -418,6 +634,57 @@ func (provider *ProviderOnePassword) getAllForVault(vaultID string, ref esv1beta
 	}
 
 	return nil
+}
+
+// waitForFunc will wait for OnePassword to _actually_ create/update the secret. OnePassword returns immediately after
+// the initial create/update which makes the next call for the same item create/update a new item with the same name. Hence, we'll
+// wait for the item to exist or be updated on OnePassword's side as well.
+// Ideally we could do bulk operations and handle data with one submit, but that would require re-writing the entire
+// push secret controller. For now, this is sufficient.
+func (provider *ProviderOnePassword) waitForFunc(ctx context.Context, fn func() error) error {
+	// check every .5 seconds
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	done, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	var err error
+	for {
+		select {
+		case <-tick.C:
+			if err = fn(); err == nil {
+				return nil
+			}
+		case <-done.Done():
+			return fmt.Errorf("timeout to wait for function to run successfully; last error was: %w", err)
+		}
+	}
+}
+
+func (provider *ProviderOnePassword) waitForItemToExist(title string) func() error {
+	return func() error {
+		_, err := provider.findItem(title)
+
+		return err
+	}
+}
+
+func (provider *ProviderOnePassword) waitForLabelToBeUpdated(title, label string, val []byte) func() error {
+	return func() error {
+		item, err := provider.findItem(title)
+		if err != nil {
+			return err
+		}
+
+		for _, field := range item.Fields {
+			// we found the label with the right value
+			if field.Label == label && field.Value == string(val) {
+				return nil
+			}
+		}
+
+		return fmt.Errorf("label %s no found on value with title %s", title, label)
+	}
 }
 
 func countFieldsWithLabel(fieldLabel string, fields []*onepassword.ItemField) int {

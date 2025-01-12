@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package util
 
 import (
@@ -23,37 +24,43 @@ import (
 
 	fluxhelm "github.com/fluxcd/helm-controller/api/v2beta1"
 	fluxsrc "github.com/fluxcd/source-controller/api/v1beta2"
-
-	// nolint
-	. "github.com/onsi/ginkgo/v2"
 	v1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/remotecommand"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+
+	// nolint
+	. "github.com/onsi/ginkgo/v2"
 
 	esv1alpha1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1alpha1"
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	genv1alpha1 "github.com/external-secrets/external-secrets/apis/generators/v1alpha1"
 )
 
-var Scheme = runtime.NewScheme()
+var scheme = runtime.NewScheme()
 
 func init() {
-	_ = scheme.AddToScheme(Scheme)
-	_ = esv1beta1.AddToScheme(Scheme)
-	_ = esv1alpha1.AddToScheme(Scheme)
-	_ = genv1alpha1.AddToScheme(Scheme)
-	_ = fluxhelm.AddToScheme(Scheme)
-	_ = fluxsrc.AddToScheme(Scheme)
-	_ = apiextensionsv1.AddToScheme(Scheme)
+	// kubernetes schemes
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(apiextensionsv1.AddToScheme(scheme))
+
+	// external-secrets schemes
+	utilruntime.Must(esv1beta1.AddToScheme(scheme))
+	utilruntime.Must(esv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(genv1alpha1.AddToScheme(scheme))
+
+	// other schemes
+	utilruntime.Must(fluxhelm.AddToScheme(scheme))
+	utilruntime.Must(fluxsrc.AddToScheme(scheme))
 }
 
 const (
@@ -99,6 +106,17 @@ func namespaceNotExist(c kubernetes.Interface, namespace string) wait.ConditionF
 // ExecCmd exec command on specific pod and wait the command's output.
 func ExecCmd(client kubernetes.Interface, config *restclient.Config, podName, namespace string,
 	command string) (string, error) {
+	return execCmd(client, config, podName, "", namespace, command)
+}
+
+// ExecCmdWithContainer exec command on specific container in a specific pod and wait the command's output.
+func ExecCmdWithContainer(client kubernetes.Interface, config *restclient.Config, podName, containerName, namespace string,
+	command string) (string, error) {
+	return execCmd(client, config, podName, containerName, namespace, command)
+}
+
+func execCmd(client kubernetes.Interface, config *restclient.Config, podName, containerName, namespace string,
+	command string) (string, error) {
 	cmd := []string{
 		"sh",
 		"-c",
@@ -108,15 +126,16 @@ func ExecCmd(client kubernetes.Interface, config *restclient.Config, podName, na
 	req := client.CoreV1().RESTClient().Post().Resource("pods").Name(podName).
 		Namespace(namespace).SubResource("exec")
 	option := &v1.PodExecOptions{
-		Command: cmd,
-		Stdin:   false,
-		Stdout:  true,
-		Stderr:  true,
-		TTY:     false,
+		Command:   cmd,
+		Container: containerName,
+		Stdin:     false,
+		Stdout:    true,
+		Stderr:    true,
+		TTY:       false,
 	}
 	req.VersionedParams(
 		option,
-		scheme.ParameterCodec,
+		clientgoscheme.ParameterCodec,
 	)
 	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
 	if err != nil {
@@ -250,6 +269,10 @@ func GetKubeSA(baseName string, kubeClientSet kubernetes.Interface, ns string) (
 	return kubeClientSet.CoreV1().ServiceAccounts(ns).Get(context.TODO(), baseName, metav1.GetOptions{})
 }
 
+func GetKubeSecret(client kubernetes.Interface, namespace, secretName string) (*v1.Secret, error) {
+	return client.CoreV1().Secrets(namespace).Get(context.TODO(), secretName, metav1.GetOptions{})
+}
+
 // NewConfig loads and returns the kubernetes credentials from the environment.
 // KUBECONFIG env var takes precedence and falls back to in-cluster config.
 func NewConfig() (*restclient.Config, *kubernetes.Clientset, crclient.Client) {
@@ -273,7 +296,7 @@ func NewConfig() (*restclient.Config, *kubernetes.Clientset, crclient.Client) {
 		Fail(err.Error())
 	}
 
-	CRClient, err := crclient.New(kubeConfig, crclient.Options{Scheme: Scheme})
+	CRClient, err := crclient.New(kubeConfig, crclient.Options{Scheme: scheme})
 	if err != nil {
 		Fail(err.Error())
 	}

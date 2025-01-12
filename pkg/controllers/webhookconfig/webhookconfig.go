@@ -17,7 +17,7 @@ package webhookconfig
 import (
 	"context"
 	"encoding/base64"
-	"fmt"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -33,6 +33,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
+
+	"github.com/external-secrets/external-secrets/pkg/constants"
 )
 
 type Reconciler struct {
@@ -46,31 +48,41 @@ type Reconciler struct {
 	SecretName      string
 	SecretNamespace string
 
-	rdyMu *sync.Mutex
-	ready bool
+	// store state for the readiness probe.
+	// we're ready when we're not the leader or
+	// if we've reconciled the webhook config when we're the leader.
+	leaderChan     <-chan struct{}
+	leaderElected  bool
+	webhookReadyMu *sync.Mutex
+	webhookReady   bool
 }
 
-func New(k8sClient client.Client, scheme *runtime.Scheme,
-	log logr.Logger, svcName, svcNamespace, secretName, secretNamespace string,
-	requeueInterval time.Duration) *Reconciler {
+type Opts struct {
+	SvcName         string
+	SvcNamespace    string
+	SecretName      string
+	SecretNamespace string
+	RequeueInterval time.Duration
+}
+
+func New(k8sClient client.Client, scheme *runtime.Scheme, leaderChan <-chan struct{}, log logr.Logger, opts Opts) *Reconciler {
 	return &Reconciler{
 		Client:          k8sClient,
 		Scheme:          scheme,
 		Log:             log,
-		RequeueDuration: requeueInterval,
-		SvcName:         svcName,
-		SvcNamespace:    svcNamespace,
-		SecretName:      secretName,
-		SecretNamespace: secretNamespace,
-		rdyMu:           &sync.Mutex{},
-		ready:           false,
+		RequeueDuration: opts.RequeueInterval,
+		SvcName:         opts.SvcName,
+		SvcNamespace:    opts.SvcNamespace,
+		SecretName:      opts.SecretName,
+		SecretNamespace: opts.SecretNamespace,
+		leaderChan:      leaderChan,
+		leaderElected:   false,
+		webhookReadyMu:  &sync.Mutex{},
+		webhookReady:    false,
 	}
 }
 
 const (
-	wellKnownLabelKey   = "external-secrets.io/component"
-	wellKnownLabelValue = "webhook"
-
 	ReasonUpdateFailed   = "UpdateFailed"
 	errWebhookNotReady   = "webhook not ready"
 	errSubsetsNotReady   = "subsets not ready"
@@ -91,8 +103,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, err
 	}
 
-	if cfg.Labels[wellKnownLabelKey] != wellKnownLabelValue {
-		log.Info("ignoring webhook due to missing labels", wellKnownLabelKey, wellKnownLabelValue)
+	if cfg.Labels[constants.WellKnownLabelKey] != constants.WellKnownLabelValueWebhook {
+		log.Info("ignoring webhook due to missing labels", constants.WellKnownLabelKey, constants.WellKnownLabelValueWebhook)
 		return ctrl.Result{}, nil
 	}
 
@@ -109,9 +121,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// right now we only have one single
 	// webhook config we care about
-	r.rdyMu.Lock()
-	defer r.rdyMu.Unlock()
-	r.ready = true
+	r.webhookReadyMu.Lock()
+	defer r.webhookReadyMu.Unlock()
+	r.webhookReady = true
 	return ctrl.Result{
 		RequeueAfter: r.RequeueDuration,
 	}, nil
@@ -126,10 +138,20 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options)
 }
 
 func (r *Reconciler) ReadyCheck(_ *http.Request) error {
-	r.rdyMu.Lock()
-	defer r.rdyMu.Unlock()
-	if !r.ready {
-		return fmt.Errorf(errWebhookNotReady)
+	// skip readiness check if we're not leader
+	// as we depend on caches and being able to reconcile Webhooks
+	if !r.leaderElected {
+		select {
+		case <-r.leaderChan:
+			r.leaderElected = true
+		default:
+			return nil
+		}
+	}
+	r.webhookReadyMu.Lock()
+	defer r.webhookReadyMu.Unlock()
+	if !r.webhookReady {
+		return errors.New(errWebhookNotReady)
 	}
 	var eps v1.Endpoints
 	err := r.Get(context.TODO(), types.NamespacedName{
@@ -140,10 +162,10 @@ func (r *Reconciler) ReadyCheck(_ *http.Request) error {
 		return err
 	}
 	if len(eps.Subsets) == 0 {
-		return fmt.Errorf(errSubsetsNotReady)
+		return errors.New(errSubsetsNotReady)
 	}
 	if len(eps.Subsets[0].Addresses) == 0 {
-		return fmt.Errorf(errAddressesNotReady)
+		return errors.New(errAddressesNotReady)
 	}
 	return nil
 }
@@ -162,7 +184,7 @@ func (r *Reconciler) updateConfig(ctx context.Context, cfg *admissionregistratio
 
 	crt, ok := secret.Data[caCertName]
 	if !ok {
-		return fmt.Errorf(errCACertNotReady)
+		return errors.New(errCACertNotReady)
 	}
 	if err := r.inject(cfg, r.SvcName, r.SvcNamespace, crt); err != nil {
 		return err

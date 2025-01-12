@@ -56,8 +56,10 @@ Be sure the `keepersecurity` provider is listed in the `Kind=SecretStore`
         * Files: Record's file's Name
     * `find.tags` are not supported at this time.
 
+**NOTE:** For complex [types](https://docs.keeper.io/secrets-manager/secrets-manager/about/field-record-types), like name, phone, bankAccount, which does not match with a single string value, external secrets will return the complete json string. Use the json template functions to decode.
+
 ### Creating external secret
-To create a kubernetes secret from the GCP Secret Manager secret a `Kind=ExternalSecret` is needed.
+To create a kubernetes secret from Keeper Secret Manager secret a `Kind=ExternalSecret` is needed.
 
 ```yaml
 {% include 'keepersecurity-external-secret.yaml' %}
@@ -78,7 +80,7 @@ There are some limitations using this provider.
 
 ## Push Secrets
 
-Push Secret will only work with a custom KeeperSecurity Record type `ExternalSecret`
+Push Secret will only work with a custom KeeperSecurity Record type `externalSecrets`
 
 ### Behavior
 * `selector`:

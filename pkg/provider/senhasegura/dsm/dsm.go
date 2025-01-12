@@ -19,12 +19,11 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 
-	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	esv1beta1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1beta1"
 	senhaseguraAuth "github.com/external-secrets/external-secrets/pkg/provider/senhasegura/auth"
@@ -80,6 +79,7 @@ var (
 	errInvalidResponseBody = errors.New("invalid HTTP response body received from senhasegura")
 	errInvalidHTTPCode     = errors.New("received invalid HTTP code from senhasegura")
 	errApplicationError    = errors.New("received application error from senhasegura")
+	errNotImplemented      = errors.New("not implemented")
 )
 
 /*
@@ -92,13 +92,17 @@ func New(isoSession *senhaseguraAuth.SenhaseguraIsoSession) (*DSM, error) {
 	}, nil
 }
 
-func (dsm *DSM) DeleteSecret(_ context.Context, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (dsm *DSM) DeleteSecret(_ context.Context, _ esv1beta1.PushSecretRemoteRef) error {
+	return errNotImplemented
+}
+
+func (dsm *DSM) SecretExists(_ context.Context, _ esv1beta1.PushSecretRemoteRef) (bool, error) {
+	return false, errNotImplemented
 }
 
 // Not Implemented PushSecret.
-func (dsm *DSM) PushSecret(_ context.Context, _ []byte, _ *apiextensionsv1.JSON, _ esv1beta1.PushRemoteRef) error {
-	return fmt.Errorf("not implemented")
+func (dsm *DSM) PushSecret(_ context.Context, _ *corev1.Secret, _ esv1beta1.PushSecretData) error {
+	return errNotImplemented
 }
 
 /*
@@ -165,7 +169,7 @@ TODO: GetAllSecrets functionality is to get secrets from either regexp-matching 
 https://github.com/external-secrets/external-secrets/pull/830#discussion_r858657107
 */
 func (dsm *DSM) GetAllSecrets(_ context.Context, _ esv1beta1.ExternalSecretFind) (secretData map[string][]byte, err error) {
-	return nil, fmt.Errorf("GetAllSecrets not implemented yet")
+	return nil, errNotImplemented
 }
 
 /*

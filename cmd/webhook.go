@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package cmd
 
 import (
@@ -28,6 +29,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap/zapcore"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -44,9 +46,12 @@ const (
 )
 
 func init() {
-	_ = clientgoscheme.AddToScheme(scheme)
-	_ = esv1beta1.AddToScheme(scheme)
-	_ = esv1alpha1.AddToScheme(scheme)
+	// kubernetes schemes
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+
+	// external-secrets schemes
+	utilruntime.Must(esv1beta1.AddToScheme(scheme))
+	utilruntime.Must(esv1alpha1.AddToScheme(scheme))
 }
 
 var webhookCmd = &cobra.Command{
@@ -210,10 +215,10 @@ func waitForCerts(c crds.CertInfo, timeout time.Duration) error {
 		if err == nil {
 			return nil
 		}
-		if err != nil {
-			setupLog.Error(err, "invalid certs. retrying...")
-			<-time.After(time.Second * 10)
-		}
+
+		setupLog.Error(err, "invalid certs. retrying...")
+		<-time.After(time.Second * 10)
+
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}

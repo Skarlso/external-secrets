@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -27,9 +28,11 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	esapi "github.com/external-secrets/external-secrets/apis/externalsecrets/v1alpha1"
@@ -38,19 +41,23 @@ import (
 	"github.com/external-secrets/external-secrets/pkg/controllers/pushsecret/psmetrics"
 	"github.com/external-secrets/external-secrets/pkg/controllers/secretstore"
 	"github.com/external-secrets/external-secrets/pkg/provider/util/locks"
+	"github.com/external-secrets/external-secrets/pkg/utils"
+	"github.com/external-secrets/external-secrets/pkg/utils/resolvers"
+
+	// load generators.
+	_ "github.com/external-secrets/external-secrets/pkg/generator/register"
 )
 
 const (
-	errFailedGetSecret        = "could not get source secret"
-	errPatchStatus            = "error merging"
-	errGetSecretStore         = "could not get SecretStore %q, %w"
-	errGetClusterSecretStore  = "could not get ClusterSecretStore %q, %w"
-	errGetProviderFailed      = "could not start provider"
-	errGetSecretsClientFailed = "could not start secrets client"
-	errCloseStoreClient       = "error when calling provider close method"
-	errSetSecretFailed        = "could not write remote ref %v to target secretstore %v: %v"
-	errFailedSetSecret        = "set secret failed: %v"
-	pushSecretFinalizer       = "pushsecret.externalsecrets.io/finalizer"
+	errFailedGetSecret         = "could not get source secret"
+	errPatchStatus             = "error merging"
+	errGetSecretStore          = "could not get SecretStore %q, %w"
+	errGetClusterSecretStore   = "could not get ClusterSecretStore %q, %w"
+	errSetSecretFailed         = "could not write remote ref %v to target secretstore %v: %v"
+	errFailedSetSecret         = "set secret failed: %v"
+	errConvert                 = "could not apply conversion strategy to keys: %v"
+	pushSecretFinalizer        = "pushsecret.externalsecrets.io/finalizer"
+	errCloudNotUpdateFinalizer = "could not update finalizers: %w"
 )
 
 type Reconciler struct {
@@ -58,8 +65,18 @@ type Reconciler struct {
 	Log             logr.Logger
 	Scheme          *runtime.Scheme
 	recorder        record.EventRecorder
+	RestConfig      *rest.Config
 	RequeueInterval time.Duration
 	ControllerClass string
+}
+
+func (r *Reconciler) SetupWithManager(mgr ctrl.Manager, opts controller.Options) error {
+	r.recorder = mgr.GetEventRecorderFor("pushsecret")
+
+	return ctrl.NewControllerManagedBy(mgr).
+		WithOptions(opts).
+		For(&esapi.PushSecret{}).
+		Complete(r)
 }
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -72,15 +89,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	defer func() { pushSecretReconcileDuration.With(resourceLabels).Set(float64(time.Since(start))) }()
 
 	var ps esapi.PushSecret
-	err := r.Get(ctx, req.NamespacedName, &ps)
 	mgr := secretstore.NewManager(r.Client, r.ControllerClass, false)
 	defer mgr.Close(ctx)
-	if apierrors.IsNotFound(err) {
-		return ctrl.Result{}, nil
-	} else if err != nil {
+
+	if err := r.Get(ctx, req.NamespacedName, &ps); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+
 		msg := "unable to get PushSecret"
 		r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
 		log.Error(err, msg)
+
 		return ctrl.Result{}, fmt.Errorf("get resource: %w", err)
 	}
 
@@ -91,8 +111,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	p := client.MergeFrom(ps.DeepCopy())
 	defer func() {
-		err := r.Client.Status().Patch(ctx, &ps, p)
-		if err != nil {
+		if err := r.Client.Status().Patch(ctx, &ps, p); err != nil {
 			log.Error(err, errPatchStatus)
 		}
 	}()
@@ -102,10 +121,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if ps.ObjectMeta.DeletionTimestamp.IsZero() {
 			if !controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
 				controllerutil.AddFinalizer(&ps, pushSecretFinalizer)
-				err := r.Client.Update(ctx, &ps, &client.UpdateOptions{})
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
+				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
+					return ctrl.Result{}, fmt.Errorf(errCloudNotUpdateFinalizer, err)
 				}
+
 				return ctrl.Result{}, nil
 			}
 		} else {
@@ -114,38 +133,56 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				badState, err := r.DeleteSecretFromProviders(ctx, &ps, esapi.SyncedPushSecretsMap{}, mgr)
 				if err != nil {
 					msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-					cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
-					ps = SetPushSecretCondition(ps, *cond)
-					r.SetSyncedSecrets(&ps, badState)
-					r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
+					r.markAsFailed(msg, &ps, badState)
+
 					return ctrl.Result{}, err
 				}
+
 				controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
-				err = r.Client.Update(ctx, &ps, &client.UpdateOptions{})
-				if err != nil {
-					return ctrl.Result{}, fmt.Errorf("could not update finalizers: %w", err)
+				if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
+					return ctrl.Result{}, fmt.Errorf(errCloudNotUpdateFinalizer, err)
 				}
+
 				return ctrl.Result{}, nil
 			}
 		}
 	case esapi.PushSecretDeletionPolicyNone:
+		if controllerutil.ContainsFinalizer(&ps, pushSecretFinalizer) {
+			controllerutil.RemoveFinalizer(&ps, pushSecretFinalizer)
+			if err := r.Client.Update(ctx, &ps, &client.UpdateOptions{}); err != nil {
+				return ctrl.Result{}, fmt.Errorf(errCloudNotUpdateFinalizer, err)
+			}
+		}
 	default:
 	}
 
-	secret, err := r.GetSecret(ctx, ps)
+	secret, err := r.resolveSecret(ctx, ps)
 	if err != nil {
-		cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, errFailedGetSecret)
-		ps = SetPushSecretCondition(ps, *cond)
-		r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, errFailedGetSecret)
+		r.markAsFailed(errFailedGetSecret, &ps, nil)
+
 		return ctrl.Result{}, err
 	}
 	secretStores, err := r.GetSecretStores(ctx, ps)
 	if err != nil {
-		cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, err.Error())
-		ps = SetPushSecretCondition(ps, *cond)
-		r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, err.Error())
+		r.markAsFailed(err.Error(), &ps, nil)
+
 		return ctrl.Result{}, err
 	}
+
+	if err := r.applyTemplate(ctx, &ps, secret); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	secretStores, err = removeUnmanagedStores(ctx, req.Namespace, r, secretStores)
+	if err != nil {
+		r.markAsFailed(err.Error(), &ps, nil)
+		return ctrl.Result{}, err
+	}
+	// if no stores are managed by this controller
+	if len(secretStores) == 0 {
+		return ctrl.Result{}, nil
+	}
+
 	syncedSecrets, err := r.PushSecretToProviders(ctx, secretStores, ps, secret, mgr)
 	if err != nil {
 		if errors.Is(err, locks.ErrConflict) {
@@ -153,12 +190,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{Requeue: true}, nil
 		}
 
-		msg := fmt.Sprintf(errFailedSetSecret, err)
-		cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
-		ps = SetPushSecretCondition(ps, *cond)
 		totalSecrets := mergeSecretState(syncedSecrets, ps.Status.SyncedPushSecrets)
-		r.SetSyncedSecrets(&ps, totalSecrets)
-		r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
+		msg := fmt.Sprintf(errFailedSetSecret, err)
+		r.markAsFailed(msg, &ps, totalSecrets)
+
 		return ctrl.Result{}, err
 	}
 	switch ps.Spec.DeletionPolicy {
@@ -166,23 +201,39 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		badSyncState, err := r.DeleteSecretFromProviders(ctx, &ps, syncedSecrets, mgr)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to Delete Secrets from Provider: %v", err)
-			cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
-			ps = SetPushSecretCondition(ps, *cond)
-			r.SetSyncedSecrets(&ps, badSyncState)
-			r.recorder.Event(&ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
+			r.markAsFailed(msg, &ps, badSyncState)
 			return ctrl.Result{}, err
 		}
 	case esapi.PushSecretDeletionPolicyNone:
 	default:
 	}
-	msg := "PushSecret synced successfully"
-	cond := NewPushSecretCondition(esapi.PushSecretReady, v1.ConditionTrue, esapi.ReasonSynced, msg)
-	ps = SetPushSecretCondition(ps, *cond)
-	r.SetSyncedSecrets(&ps, syncedSecrets)
-	r.recorder.Event(&ps, v1.EventTypeNormal, esapi.ReasonSynced, msg)
+
+	r.markAsDone(&ps, syncedSecrets)
+
 	return ctrl.Result{RequeueAfter: refreshInt}, nil
 }
-func (r *Reconciler) SetSyncedSecrets(ps *esapi.PushSecret, status esapi.SyncedPushSecretsMap) {
+
+func (r *Reconciler) markAsFailed(msg string, ps *esapi.PushSecret, syncState esapi.SyncedPushSecretsMap) {
+	cond := newPushSecretCondition(esapi.PushSecretReady, v1.ConditionFalse, esapi.ReasonErrored, msg)
+	setPushSecretCondition(ps, *cond)
+	if syncState != nil {
+		r.setSecrets(ps, syncState)
+	}
+	r.recorder.Event(ps, v1.EventTypeWarning, esapi.ReasonErrored, msg)
+}
+
+func (r *Reconciler) markAsDone(ps *esapi.PushSecret, secrets esapi.SyncedPushSecretsMap) {
+	msg := "PushSecret synced successfully"
+	if ps.Spec.UpdatePolicy == esapi.PushSecretUpdatePolicyIfNotExists {
+		msg += ". Existing secrets in providers unchanged."
+	}
+	cond := newPushSecretCondition(esapi.PushSecretReady, v1.ConditionTrue, esapi.ReasonSynced, msg)
+	setPushSecretCondition(ps, *cond)
+	r.setSecrets(ps, secrets)
+	r.recorder.Event(ps, v1.EventTypeNormal, esapi.ReasonSynced, msg)
+}
+
+func (r *Reconciler) setSecrets(ps *esapi.PushSecret, status esapi.SyncedPushSecretsMap) {
 	ps.Status.SyncedPushSecrets = status
 }
 
@@ -193,9 +244,7 @@ func mergeSecretState(newMap, old esapi.SyncedPushSecretsMap) esapi.SyncedPushSe
 		if !ok {
 			out[k] = make(map[string]esapi.PushSecretData)
 		}
-		for kk, vv := range v {
-			out[k][kk] = vv
-		}
+		maps.Insert(out[k], maps.All(v))
 	}
 	return out
 }
@@ -249,41 +298,95 @@ func (r *Reconciler) DeleteSecretFromStore(ctx context.Context, client v1beta1.S
 }
 
 func (r *Reconciler) PushSecretToProviders(ctx context.Context, stores map[esapi.PushSecretStoreRef]v1beta1.GenericStore, ps esapi.PushSecret, secret *v1.Secret, mgr *secretstore.Manager) (esapi.SyncedPushSecretsMap, error) {
-	out := esapi.SyncedPushSecretsMap{}
+	out := make(esapi.SyncedPushSecretsMap)
 	for ref, store := range stores {
-		storeKey := fmt.Sprintf("%v/%v", ref.Kind, store.GetName())
-		out[storeKey] = make(map[string]esapi.PushSecretData)
-		storeRef := v1beta1.SecretStoreRef{
-			Name: store.GetName(),
-			Kind: ref.Kind,
-		}
-		client, err := mgr.Get(ctx, storeRef, ps.GetNamespace(), nil)
+		out, err := r.handlePushSecretDataForStore(ctx, ps, secret, out, mgr, store.GetName(), ref.Kind)
 		if err != nil {
-			return out, fmt.Errorf("could not get secrets client for store %v: %w", store.GetName(), err)
-		}
-		for _, data := range ps.Spec.Data {
-			secretValue, ok := secret.Data[data.Match.SecretKey]
-			if !ok {
-				return out, fmt.Errorf("secret key %v does not exist", data.Match.SecretKey)
-			}
-
-			err := client.PushSecret(ctx, secretValue, data.Metadata, data.Match.RemoteRef)
-			if err != nil {
-				return out, fmt.Errorf(errSetSecretFailed, data.Match.SecretKey, store.GetName(), err)
-			}
-			out[storeKey][statusRef(data.Match.RemoteRef)] = data
+			return out, err
 		}
 	}
 	return out, nil
 }
-func (r *Reconciler) GetSecret(ctx context.Context, ps esapi.PushSecret) (*v1.Secret, error) {
-	secretName := types.NamespacedName{Name: ps.Spec.Selector.Secret.Name, Namespace: ps.Namespace}
-	secret := &v1.Secret{}
-	err := r.Client.Get(ctx, secretName, secret)
-	if err != nil {
-		return nil, err
+
+func (r *Reconciler) handlePushSecretDataForStore(ctx context.Context, ps esapi.PushSecret, secret *v1.Secret, out esapi.SyncedPushSecretsMap, mgr *secretstore.Manager, storeName, refKind string) (esapi.SyncedPushSecretsMap, error) {
+	storeKey := fmt.Sprintf("%v/%v", refKind, storeName)
+	out[storeKey] = make(map[string]esapi.PushSecretData)
+	storeRef := v1beta1.SecretStoreRef{
+		Name: storeName,
+		Kind: refKind,
 	}
-	return secret, nil
+	originalSecretData := secret.Data
+	secretClient, err := mgr.Get(ctx, storeRef, ps.GetNamespace(), nil)
+	if err != nil {
+		return out, fmt.Errorf("could not get secrets client for store %v: %w", storeName, err)
+	}
+	for _, data := range ps.Spec.Data {
+		secretData, err := utils.ReverseKeys(data.ConversionStrategy, originalSecretData)
+		if err != nil {
+			return nil, fmt.Errorf(errConvert, err)
+		}
+		secret.Data = secretData
+		key := data.GetSecretKey()
+		if !secretKeyExists(key, secret) {
+			return out, fmt.Errorf("secret key %v does not exist", key)
+		}
+		switch ps.Spec.UpdatePolicy {
+		case esapi.PushSecretUpdatePolicyIfNotExists:
+			exists, err := secretClient.SecretExists(ctx, data.Match.RemoteRef)
+			if err != nil {
+				return out, fmt.Errorf("could not verify if secret exists in store: %w", err)
+			} else if exists {
+				out[storeKey][statusRef(data)] = data
+				continue
+			}
+		case esapi.PushSecretUpdatePolicyReplace:
+		default:
+		}
+		if err := secretClient.PushSecret(ctx, secret, data); err != nil {
+			return out, fmt.Errorf(errSetSecretFailed, key, storeName, err)
+		}
+		out[storeKey][statusRef(data)] = data
+	}
+	return out, nil
+}
+
+func secretKeyExists(key string, secret *v1.Secret) bool {
+	_, ok := secret.Data[key]
+	return key == "" || ok
+}
+
+func (r *Reconciler) resolveSecret(ctx context.Context, ps esapi.PushSecret) (*v1.Secret, error) {
+	if ps.Spec.Selector.Secret != nil {
+		secretName := types.NamespacedName{Name: ps.Spec.Selector.Secret.Name, Namespace: ps.Namespace}
+		secret := &v1.Secret{}
+		err := r.Client.Get(ctx, secretName, secret)
+		if err != nil {
+			return nil, err
+		}
+		return secret, nil
+	}
+	if ps.Spec.Selector.GeneratorRef != nil {
+		return r.resolveSecretFromGenerator(ctx, ps.Namespace, ps.Spec.Selector.GeneratorRef)
+	}
+	return nil, errors.New("no secret selector provided")
+}
+
+func (r *Reconciler) resolveSecretFromGenerator(ctx context.Context, namespace string, generatorRef *v1beta1.GeneratorRef) (*v1.Secret, error) {
+	gen, obj, err := resolvers.GeneratorRef(ctx, r.Client, r.Scheme, namespace, generatorRef)
+	if err != nil {
+		return nil, fmt.Errorf("unable to resolve generator: %w", err)
+	}
+	secretMap, err := gen.Generate(ctx, obj, r.Client, namespace)
+	if err != nil {
+		return nil, fmt.Errorf("unable to generate: %w", err)
+	}
+	return &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "___generated-secret",
+			Namespace: namespace,
+		},
+		Data: secretMap,
+	}, err
 }
 
 func (r *Reconciler) GetSecretStores(ctx context.Context, ps esapi.PushSecret) (map[esapi.PushSecretStoreRef]v1beta1.GenericStore, error) {
@@ -334,7 +437,7 @@ func (r *Reconciler) GetSecretStores(ctx context.Context, ps esapi.PushSecret) (
 
 func (r *Reconciler) getSecretStoreFromName(ctx context.Context, refStore esapi.PushSecretStoreRef, ns string) (v1beta1.GenericStore, error) {
 	if refStore.Name == "" {
-		return nil, fmt.Errorf("refStore Name must be provided")
+		return nil, errors.New("refStore Name must be provided")
 	}
 	ref := types.NamespacedName{
 		Name: refStore.Name,
@@ -355,15 +458,8 @@ func (r *Reconciler) getSecretStoreFromName(ctx context.Context, refStore esapi.
 	}
 	return &store, nil
 }
-func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.recorder = mgr.GetEventRecorderFor("pushsecret")
 
-	return ctrl.NewControllerManagedBy(mgr).
-		For(&esapi.PushSecret{}).
-		Complete(r)
-}
-
-func NewPushSecretCondition(condType esapi.PushSecretConditionType, status v1.ConditionStatus, reason, message string) *esapi.PushSecretStatusCondition {
+func newPushSecretCondition(condType esapi.PushSecretConditionType, status v1.ConditionStatus, reason, message string) *esapi.PushSecretStatusCondition {
 	return &esapi.PushSecretStatusCondition{
 		Type:               condType,
 		Status:             status,
@@ -373,12 +469,11 @@ func NewPushSecretCondition(condType esapi.PushSecretConditionType, status v1.Co
 	}
 }
 
-func SetPushSecretCondition(gs esapi.PushSecret, condition esapi.PushSecretStatusCondition) esapi.PushSecret {
-	status := gs.Status
-	currentCond := GetPushSecretCondition(status, condition.Type)
+func setPushSecretCondition(ps *esapi.PushSecret, condition esapi.PushSecretStatusCondition) {
+	currentCond := getPushSecretCondition(ps.Status, condition.Type)
 	if currentCond != nil && currentCond.Status == condition.Status &&
 		currentCond.Reason == condition.Reason && currentCond.Message == condition.Message {
-		return gs
+		return
 	}
 
 	// Do not update lastTransitionTime if the status of the condition doesn't change.
@@ -386,9 +481,7 @@ func SetPushSecretCondition(gs esapi.PushSecret, condition esapi.PushSecretStatu
 		condition.LastTransitionTime = currentCond.LastTransitionTime
 	}
 
-	status.Conditions = append(filterOutCondition(status.Conditions, condition.Type), condition)
-	gs.Status = status
-	return gs
+	ps.Status.Conditions = append(filterOutCondition(ps.Status.Conditions, condition.Type), condition)
 }
 
 // filterOutCondition returns an empty set of conditions with the provided type.
@@ -403,8 +496,8 @@ func filterOutCondition(conditions []esapi.PushSecretStatusCondition, condType e
 	return newConditions
 }
 
-// GetSecretStoreCondition returns the condition with the provided type.
-func GetPushSecretCondition(status esapi.PushSecretStatus, condType esapi.PushSecretConditionType) *esapi.PushSecretStatusCondition {
+// getPushSecretCondition returns the condition with the provided type.
+func getPushSecretCondition(status esapi.PushSecretStatus, condType esapi.PushSecretConditionType) *esapi.PushSecretStatusCondition {
 	for i := range status.Conditions {
 		c := status.Conditions[i]
 		if c.Type == condType {
@@ -414,9 +507,38 @@ func GetPushSecretCondition(status esapi.PushSecretStatus, condType esapi.PushSe
 	return nil
 }
 
-func statusRef(ref v1beta1.PushRemoteRef) string {
+func statusRef(ref v1beta1.PushSecretData) string {
 	if ref.GetProperty() != "" {
 		return ref.GetRemoteKey() + "/" + ref.GetProperty()
 	}
 	return ref.GetRemoteKey()
+}
+
+// removeUnmanagedStores iterates over all SecretStore references and evaluates the controllerClass property.
+// Returns a map containing only managed stores.
+func removeUnmanagedStores(ctx context.Context, namespace string, r *Reconciler, ss map[esapi.PushSecretStoreRef]v1beta1.GenericStore) (map[esapi.PushSecretStoreRef]v1beta1.GenericStore, error) {
+	for ref := range ss {
+		var store v1beta1.GenericStore
+		switch ref.Kind {
+		case v1beta1.SecretStoreKind:
+			store = &v1beta1.SecretStore{}
+		case v1beta1.ClusterSecretStoreKind:
+			store = &v1beta1.ClusterSecretStore{}
+			namespace = ""
+		}
+		err := r.Client.Get(ctx, types.NamespacedName{
+			Name:      ref.Name,
+			Namespace: namespace,
+		}, store)
+
+		if err != nil {
+			return ss, err
+		}
+
+		class := store.GetSpec().Controller
+		if class != "" && class != r.ControllerClass {
+			delete(ss, ref)
+		}
+	}
+	return ss, nil
 }

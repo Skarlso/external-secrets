@@ -102,7 +102,7 @@ func (g *Generator) generate(
 	fetchAccessToken accessTokenFetcher,
 	fetchRefreshToken refreshTokenFetcher) (map[string][]byte, error) {
 	if jsonSpec == nil {
-		return nil, fmt.Errorf(errNoSpec)
+		return nil, errors.New(errNoSpec)
 	}
 	res, err := parseSpec(jsonSpec.Raw)
 	if err != nil {
@@ -131,13 +131,12 @@ func (g *Generator) generate(
 			ctx,
 			crClient,
 			kubeClient.CoreV1(),
-			res.Spec.ACRRegistry,
 			res.Spec.EnvironmentType,
 			res.Spec.Auth.WorkloadIdentity.ServiceAccountRef,
 			namespace,
 		)
 	} else {
-		return nil, fmt.Errorf("unexpeted configuration")
+		return nil, errors.New("unexpeted configuration")
 	}
 	if err != nil {
 		return nil, err
@@ -188,7 +187,7 @@ func fetchACRAccessToken(acrRefreshToken, _, registryURL, scope string) (string,
 	}
 	accessToken, ok := payload["access_token"]
 	if !ok {
-		return "", fmt.Errorf("unable to get token")
+		return "", errors.New("unable to get token")
 	}
 	return accessToken, nil
 }
@@ -223,17 +222,14 @@ func fetchACRRefreshToken(aadAccessToken, tenantID, registryURL string) (string,
 	}
 	refreshToken, ok := payload["refresh_token"]
 	if !ok {
-		return "", fmt.Errorf("unable to get token")
+		return "", errors.New("unable to get token")
 	}
 	return refreshToken, nil
 }
 
-func accessTokenForWorkloadIdentity(ctx context.Context, crClient client.Client, kubeClient kcorev1.CoreV1Interface, acrRegistry string, envType v1beta1.AzureEnvironmentType, serviceAccountRef *smmeta.ServiceAccountSelector, namespace string) (string, error) {
+func accessTokenForWorkloadIdentity(ctx context.Context, crClient client.Client, kubeClient kcorev1.CoreV1Interface, envType v1beta1.AzureEnvironmentType, serviceAccountRef *smmeta.ServiceAccountSelector, namespace string) (string, error) {
 	aadEndpoint := keyvault.AadEndpointForType(envType)
-	if !strings.HasSuffix(acrRegistry, "/") {
-		acrRegistry += "/"
-	}
-	acrResource := fmt.Sprintf("https://%s/.default", acrRegistry)
+	scope := keyvault.ServiceManagementEndpointForType(envType)
 	// if no serviceAccountRef was provided
 	// we expect certain env vars to be present.
 	// They are set by the azure workload identity webhook.
@@ -248,7 +244,7 @@ func accessTokenForWorkloadIdentity(ctx context.Context, crClient client.Client,
 		if err != nil {
 			return "", fmt.Errorf("unable to read token file %s: %w", tokenFilePath, err)
 		}
-		tp, err := keyvault.NewTokenProvider(ctx, string(token), clientID, tenantID, aadEndpoint, acrResource)
+		tp, err := keyvault.NewTokenProvider(ctx, string(token), clientID, tenantID, aadEndpoint, scope)
 		if err != nil {
 			return "", err
 		}
@@ -278,7 +274,7 @@ func accessTokenForWorkloadIdentity(ctx context.Context, crClient client.Client,
 	if err != nil {
 		return "", err
 	}
-	tp, err := keyvault.NewTokenProvider(ctx, token, clientID, tenantID, aadEndpoint, acrResource)
+	tp, err := keyvault.NewTokenProvider(ctx, token, clientID, tenantID, aadEndpoint, scope)
 	if err != nil {
 		return "", err
 	}
@@ -286,12 +282,18 @@ func accessTokenForWorkloadIdentity(ctx context.Context, crClient client.Client,
 }
 
 func accessTokenForManagedIdentity(ctx context.Context, envType v1beta1.AzureEnvironmentType, identityID string) (string, error) {
-	// handle workload identity
-	creds, err := azidentity.NewManagedIdentityCredential(
-		&azidentity.ManagedIdentityCredentialOptions{
+	// handle managed identity
+	var opts *azidentity.ManagedIdentityCredentialOptions
+	if strings.Contains(identityID, "/") {
+		opts = &azidentity.ManagedIdentityCredentialOptions{
 			ID: azidentity.ResourceID(identityID),
-		},
-	)
+		}
+	} else {
+		opts = &azidentity.ManagedIdentityCredentialOptions{
+			ID: azidentity.ClientID(identityID),
+		}
+	}
+	creds, err := azidentity.NewManagedIdentityCredential(opts)
 	if err != nil {
 		return "", err
 	}

@@ -27,12 +27,12 @@ type ConjurProvider struct {
 
 type ConjurAuth struct {
 	// +optional
-	Apikey *ConjurApikey `json:"apikey"`
+	APIKey *ConjurAPIKey `json:"apikey,omitempty"`
 	// +optional
-	Jwt *ConjurJWT `json:"jwt"`
+	Jwt *ConjurJWT `json:"jwt,omitempty"`
 }
 
-type ConjurApikey struct {
+type ConjurAPIKey struct {
 	Account   string                    `json:"account"`
 	UserRef   *esmeta.SecretKeySelector `json:"userRef"`
 	APIKeyRef *esmeta.SecretKeySelector `json:"apiKeyRef"`
@@ -44,6 +44,11 @@ type ConjurJWT struct {
 	// The conjur authn jwt webservice id
 	ServiceID string `json:"serviceID"`
 
+	// Optional HostID for JWT authentication. This may be used depending
+	// on how the Conjur JWT authenticator policy is configured.
+	// +optional
+	HostID string `json:"hostId"`
+
 	// Optional SecretRef that refers to a key in a Secret resource containing JWT token to
 	// authenticate with Conjur using the JWT authentication method.
 	// +optional
@@ -52,5 +57,5 @@ type ConjurJWT struct {
 	// Optional ServiceAccountRef specifies the Kubernetes service account for which to request
 	// a token for with the `TokenRequest` API.
 	// +optional
-	ServiceAccountRef *esmeta.ServiceAccountSelector `json:"serviceAccountRef"`
+	ServiceAccountRef *esmeta.ServiceAccountSelector `json:"serviceAccountRef,omitempty"`
 }

@@ -11,6 +11,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package webhook
 
 import (
@@ -50,6 +51,7 @@ type args struct {
 
 type want struct {
 	Path      string            `json:"path,omitempty"`
+	Body      string            `json:"body,omitempty"`
 	Err       string            `json:"err,omitempty"`
 	Result    string            `json:"result,omitempty"`
 	ResultMap map[string]string `json:"resultmap,omitempty"`
@@ -119,7 +121,7 @@ want:
   path: /api/getsecret?id=testkey&version=1
   err: failed to get response path
 ---
-case: error bad json data
+case: pull data out of map
 args:
   url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
   key: testkey
@@ -128,7 +130,8 @@ args:
   response: '{"result":{"thesecret":{"one":"secret-value"}}}'
 want:
   path: /api/getsecret?id=testkey&version=1
-  err: failed to get response (wrong type
+  err: ''
+  result: '{"one":"secret-value"}'
 ---
 case: error timeout
 args:
@@ -199,10 +202,8 @@ args:
   response: 'some simple string'
 want:
   path: /api/getsecret?id=testkey&version=1
-  err: failed to get response (wrong type
-  resultmap:
-    thesecret: secret-value
-    alsosecret: another-value
+  err: "failed to parse response json: invalid character"
+  resultmap: {}
 ---
 case: error json map
 args:
@@ -213,10 +214,8 @@ args:
   response: '{"result":{"thesecret":"secret-value","alsosecret":"another-value"}}'
 want:
   path: /api/getsecret?id=testkey&version=1
-  err: failed to get response (wrong type
-  resultmap:
-    thesecret: secret-value
-    alsosecret: another-value
+  err: "failed to parse response json from jsonpath"
+  resultmap: {}
 ---
 case: good json with good templated jsonpath
 args:
@@ -265,6 +264,79 @@ args:
 want:
   path: /api/getsecret?id=testkey&version=1
   err: "filter worked but didn't get any result"
+---
+case: success with jsonpath filter and result array
+args:
+  url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
+  key: testkey
+  version: 1
+  jsonpath: $..name
+  response: '{"secrets": [{"name": "thesecret", "value": "secret-value"}, {"name": "alsosecret", "value": "another-value"}]}'
+want:
+  path: /api/getsecret?id=testkey&version=1
+  err: ''
+  result: 'thesecret'
+---
+case: success with jsonpath filter and result array of ints
+args:
+  url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
+  key: testkey
+  version: 1
+  jsonpath: $..name
+  response: '{"secrets": [{"name": 123, "value": "secret-value"}, {"name": 456, "value": "another-value"}]}'
+want:
+  path: /api/getsecret?id=testkey&version=1
+  err: ''
+  result: 123
+---
+case: support backslash
+args:
+  url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
+  key: testkey
+  version: 1
+  jsonpath: $.refresh_token
+  response: '{"access_token":"REDACTED","refresh_token":"RE\/DACTED=="}'
+want:
+  path: /api/getsecret?id=testkey&version=1
+  err: ''
+  result: "RE/DACTED=="
+---
+case: good json with mixed fields and jsonpath filter
+args:
+  url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
+  key: testkey
+  version: 1
+  jsonpath: $.result.thesecret
+  response: '{"result":{"thesecret":"secret-value","alsosecret":"another-value", "id": 1234, "weight": 1.5}}'
+want:
+  path: /api/getsecret?id=testkey&version=1
+  err: ''
+  result: secret-value
+---
+case: good json with mixed fields to map
+args:
+  url: /api/getsecret?id={{ .remoteRef.key }}&version={{ .remoteRef.version }}
+  key: testkey
+  version: 1
+  jsonpath: $.result
+  response: '{"result":{"thesecret":"secret-value","alsosecret":"another-value", "id": 1234, "weight": 1.5}}'
+want:
+  path: /api/getsecret?id=testkey&version=1
+  err: ''
+  resultmap:
+    thesecret: secret-value
+    alsosecret: another-value
+    id: 1234
+    weight: 1.5
+---
+case: only url encoding for url templates
+args:
+  url: /api/getsecrets?folder={{ .remoteRef.key }}
+  body: '{"folder": "{{ .remoteRef.key }}"}'
+  key: /myapp/secrets
+want:
+  path: /api/getsecrets?folder=%2Fmyapp%2Fsecrets
+  body: '{"folder": "/myapp/secrets"}'
 `
 
 func TestWebhookGetSecret(t *testing.T) {
@@ -286,6 +358,12 @@ func testCaseServer(tc testCase, t *testing.T) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		if tc.Want.Path != "" && req.URL.String() != tc.Want.Path {
 			t.Errorf("%s: unexpected api path: %s, expected %s", tc.Case, req.URL.String(), tc.Want.Path)
+		}
+		if tc.Want.Body != "" {
+			b, _ := io.ReadAll(req.Body)
+			if string(b) != tc.Want.Body {
+				t.Errorf("%s: unexpected body: %s, expected %s", tc.Case, string(b), tc.Want.Body)
+			}
 		}
 		if tc.Args.StatusCode != 0 {
 			rw.WriteHeader(tc.Args.StatusCode)

@@ -11,12 +11,13 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package template
 
 import (
 	"crypto/x509"
 
-	"github.com/lestrrat-go/jwx/jwk"
+	"github.com/lestrrat-go/jwx/v2/jwk"
 )
 
 func jwkPublicKeyPem(jwkjson string) (string, error) {
@@ -24,7 +25,7 @@ func jwkPublicKeyPem(jwkjson string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	var rawkey interface{}
+	var rawkey any
 	err = k.Raw(&rawkey)
 	if err != nil {
 		return "", err
@@ -33,7 +34,7 @@ func jwkPublicKeyPem(jwkjson string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return pemEncode(string(mpk), "PUBLIC KEY")
+	return pemEncode(mpk, "PUBLIC KEY")
 }
 
 func jwkPrivateKeyPem(jwkjson string) (string, error) {
@@ -42,7 +43,7 @@ func jwkPrivateKeyPem(jwkjson string) (string, error) {
 		return "", err
 	}
 	var mpk []byte
-	var pk interface{}
+	var pk any
 	err = k.Raw(&pk)
 	if err != nil {
 		return "", err
@@ -51,5 +52,5 @@ func jwkPrivateKeyPem(jwkjson string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return pemEncode(string(mpk), "PRIVATE KEY")
+	return pemEncode(mpk, "PRIVATE KEY")
 }
