@@ -45,6 +45,6 @@ jobs:
           files: |
             render/dist/render-linux-amd64
             render/dist/render-darwin-amd64
-            render/dist/render-windows-amd64
+            render/dist/render-windows-amd64.exe
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
