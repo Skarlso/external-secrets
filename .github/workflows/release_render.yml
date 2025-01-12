@@ -34,7 +34,7 @@ jobs:
         run: go mod download
 
       - name: Build Release Binaries
-        run: cd render && make binaries VERSION=${{ github.event.inputs.version }}
+        run: make -c render/Makefile binaries VERSION=${{ github.event.inputs.version }}
 
       ## TODO: Add signing.
 
