@@ -56,7 +56,7 @@ jobs:
         uses: goreleaser/goreleaser-action@v6.1.0
         with:
           version: '~> v2'
-          args: release --clean --skip-validation
+          args: release --clean
           workdir: render
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
