@@ -42,7 +42,7 @@ jobs:
           fi
 
       - name: Create Tag if Not Exists
-        if: failure()
+        if: success()
         run: |
           TAG="${{ github.event.inputs.version }}"
           git tag $TAG
