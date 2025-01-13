@@ -1,3 +1,4 @@
+version: 2
 release:
   prerelease: auto # this should detect a release candidate and mark it as pre-release in GitHub
 
@@ -25,5 +26,7 @@ archives:
     format: tar.gz
       #binary_signs:
       #  - {}
+sboms:
+  - artifacts: archive
 checksum:
   name_template: "render_checksums.txt"
