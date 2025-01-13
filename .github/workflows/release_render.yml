@@ -33,6 +33,23 @@ jobs:
         if: ${{ steps.setup-go.outputs.cache-hit != 'true' }}
         run: go mod download
 
+      - name: Check if Tag Exists
+        id: check_tag
+        run: |
+          if git rev-parse "${{ github.event.inputs.version }}" >/dev/null 2>&1; then
+            echo "Tag exists."
+          else
+            echo "Tag does not exist."
+            exit 1
+          fi
+
+      - name: Create Tag if Not Exists
+        if: failure()
+        run: |
+          TAG="${{ github.event.inputs.version }}"
+          git tag $TAG
+          git push origin $TAG
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6.1.0
         with:
