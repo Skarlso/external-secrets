@@ -33,6 +33,10 @@ jobs:
         if: ${{ steps.setup-go.outputs.cache-hit != 'true' }}
         run: go mod download
 
+      - name: Install syft
+        run:
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+
       - name: Check if Tag Exists
         id: check_tag
         run: |
