@@ -33,18 +33,11 @@ jobs:
         if: ${{ steps.setup-go.outputs.cache-hit != 'true' }}
         run: go mod download
 
-      - name: Build Release Binaries
-        run: make -C render binaries VERSION=${{ github.event.inputs.version }}
-
-      ## TODO: Add signing.
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2.1.0
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6.1.0
         with:
-          tag_name: ${{ github.event.inputs.version }}
-          files: |
-            render/dist/render-linux-amd64
-            render/dist/render-darwin-amd64
-            render/dist/render-windows-amd64.exe
+          version: '~> v2'
+          args: release --clean
+          workdir: render
         env:
-          GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
