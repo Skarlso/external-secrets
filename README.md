@@ -3,6 +3,9 @@
 </p>
 
 
+change
+
+
 ## Project Releases Paused Until Maintainer Team is Rebuilt ⚠️
 
 The current maintainers of External Secrets Operator decided to pause official SemVer releases.
