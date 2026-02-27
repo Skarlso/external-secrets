@@ -18,6 +18,7 @@ limitations under the License.
 package onepasswordsdk
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -489,7 +490,11 @@ func (p *SecretsClient) cacheGet(key string) ([]byte, bool) {
 	if p.cache == nil {
 		return nil, false
 	}
-	return p.cache.Get(key)
+	v, ok := p.cache.Get(key)
+	if !ok {
+		return nil, false
+	}
+	return bytes.Clone(v), true
 }
 
 // cacheAdd stores a value in the cache. No-op if cache is disabled.

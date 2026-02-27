@@ -22,7 +22,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/1password/onepassword-sdk-go"
@@ -31,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	esv1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+	"github.com/external-secrets/external-secrets/runtime/cache"
 	"github.com/external-secrets/external-secrets/runtime/esutils"
 	"github.com/external-secrets/external-secrets/runtime/esutils/resolvers"
 )
@@ -47,11 +47,9 @@ const (
 	errNotImplemented                                   = "not implemented"
 )
 
-// Provider implements the External Secrets provider interface for 1Password SDK.
-// The cache lives here so it persists across reconciliation loops.
+// Provider contains the main cache for onepasswordsdk provider.
 type Provider struct {
-	cache   *expirable.LRU[string, []byte]
-	cacheMu sync.Mutex
+	clientCache *cache.Cache[esv1.SecretsClient]
 }
 
 // SecretsClient wraps a 1Password SDK client for a specific vault.
@@ -62,8 +60,18 @@ type SecretsClient struct {
 	cache       *expirable.LRU[string, []byte]
 }
 
-// NewClient constructs a new secrets client based on the provided store.
+// NewClient will create a new client.
 func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube client.Client, namespace string) (esv1.SecretsClient, error) {
+	key := cache.Key{
+		Name:      store.GetObjectMeta().Name,
+		Namespace: namespace,
+		Kind:      store.GetTypeMeta().Kind,
+	}
+
+	if cachedClient, ok := p.clientCache.Get(store.GetObjectMeta().ResourceVersion, key); ok {
+		return cachedClient, nil
+	}
+
 	config := store.GetSpec().Provider.OnePasswordSDK
 	serviceAccountToken, err := resolvers.SecretKeyRef(
 		ctx,
@@ -104,23 +112,20 @@ func (p *Provider) NewClient(ctx context.Context, store esv1.GenericStore, kube 
 	sc.vaultID = vaultID
 
 	if config.Cache != nil {
-		p.cacheMu.Lock()
-		if p.cache == nil {
-			ttl := 5 * time.Minute
-			if config.Cache.TTL.Duration > 0 {
-				ttl = config.Cache.TTL.Duration
-			}
-
-			maxSize := 100
-			if config.Cache.MaxSize > 0 {
-				maxSize = config.Cache.MaxSize
-			}
-
-			p.cache = expirable.NewLRU[string, []byte](maxSize, nil, ttl)
+		ttl := 5 * time.Minute
+		if config.Cache.TTL.Duration > 0 {
+			ttl = config.Cache.TTL.Duration
 		}
-		p.cacheMu.Unlock()
-		sc.cache = p.cache
+
+		maxSize := 100
+		if config.Cache.MaxSize > 0 {
+			maxSize = config.Cache.MaxSize
+		}
+
+		sc.cache = expirable.NewLRU[string, []byte](maxSize, nil, ttl)
 	}
+
+	p.clientCache.Add(store.GetObjectMeta().ResourceVersion, key, sc)
 
 	return sc, nil
 }
@@ -165,7 +170,9 @@ func (p *Provider) Capabilities() esv1.SecretStoreCapabilities {
 
 // NewProvider creates a new Provider instance.
 func NewProvider() esv1.Provider {
-	return &Provider{}
+	return &Provider{
+		clientCache: cache.Must[esv1.SecretsClient](100, nil),
+	}
 }
 
 // ProviderSpec returns the provider specification for registration.
