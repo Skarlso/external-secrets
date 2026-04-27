@@ -128,6 +128,7 @@ func validatePrivilegedTemplate(es *ExternalSecret) error {
 	if tpl == nil {
 		return nil
 	}
+	//nolint:exhaustive // don't need exhaustive
 	switch tpl.Type {
 	case corev1.SecretTypeServiceAccountToken:
 		if _, ok := tpl.Metadata.Annotations[corev1.ServiceAccountNameKey]; ok {
