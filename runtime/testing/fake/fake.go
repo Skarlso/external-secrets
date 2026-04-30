@@ -198,6 +198,30 @@ func (v *Client) WithSetSecret(err error) *Client {
 	return v
 }
 
+// WithSetSecretFn installs a custom SetSecret function under the client lock.
+func (v *Client) WithSetSecretFn(fn func() error) *Client {
+	v.mu.Lock()
+	v.SetSecretFn = fn
+	v.mu.Unlock()
+	return v
+}
+
+// WithDeleteSecretFn installs a custom DeleteSecret function under the client lock.
+func (v *Client) WithDeleteSecretFn(fn func() error) *Client {
+	v.mu.Lock()
+	v.DeleteSecretFn = fn
+	v.mu.Unlock()
+	return v
+}
+
+// WithSecretExistsFn installs a custom SecretExists function under the client lock.
+func (v *Client) WithSecretExistsFn(fn func(context.Context, esv1.PushSecretRemoteRef) (bool, error)) *Client {
+	v.mu.Lock()
+	v.SecretExistsFn = fn
+	v.mu.Unlock()
+	return v
+}
+
 // WithNew wraps the fake provider factory function.
 func (v *Client) WithNew(f func(context.Context, esv1.GenericStore, client.Client,
 	string) (esv1.SecretsClient, error)) *Client {
@@ -225,11 +249,28 @@ func (v *Client) NewClient(ctx context.Context, store esv1.GenericStore, kube cl
 }
 
 func (v *Client) Reset() {
-	v.WithNew(func(context.Context, esv1.GenericStore, client.Client,
-		string) (esv1.SecretsClient, error) {
-		return v, nil
-	})
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.NewFn = func(context.Context, esv1.GenericStore, client.Client, string) (esv1.SecretsClient, error) {
+		return v, nil
+	}
+	v.GetSecretFn = func(context.Context, esv1.ExternalSecretDataRemoteRef) ([]byte, error) {
+		return nil, nil
+	}
+	v.GetSecretMapFn = func(context.Context, esv1.ExternalSecretDataRemoteRef) (map[string][]byte, error) {
+		return nil, nil
+	}
+	v.GetAllSecretsFn = func(context.Context, esv1.ExternalSecretFind) (map[string][]byte, error) {
+		return nil, nil
+	}
+	v.SecretExistsFn = func(context.Context, esv1.PushSecretRemoteRef) (bool, error) {
+		return false, nil
+	}
+	v.SetSecretFn = func() error {
+		return nil
+	}
+	v.DeleteSecretFn = func() error {
+		return nil
+	}
 	v.pushSecretData = map[string]SetSecretCallArgs{}
 }
